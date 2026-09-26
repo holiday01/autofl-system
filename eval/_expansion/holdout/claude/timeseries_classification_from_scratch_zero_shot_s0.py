@@ -1,0 +1,103 @@
+import numpy as np
+import keras
+
+def readucr(filename):
+    data = np.loadtxt(filename, delimiter="\t")
+    y = data[:, 0]
+    x = data[:, 1:]
+    return x, y.astype(int)
+
+
+def build_model(config):
+    num_classes = config.get("num_classes", 2)
+    input_length = config.get("input_length", 500)
+    input_shape = (input_length, 1)
+
+    input_layer = keras.layers.Input(input_shape)
+
+    conv1 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same")(input_layer)
+    conv1 = keras.layers.BatchNormalization()(conv1)
+    conv1 = keras.layers.ReLU()(conv1)
+
+    conv2 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same")(conv1)
+    conv2 = keras.layers.BatchNormalization()(conv2)
+    conv2 = keras.layers.ReLU()(conv2)
+
+    conv3 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same")(conv2)
+    conv3 = keras.layers.BatchNormalization()(conv3)
+    conv3 = keras.layers.ReLU()(conv3)
+
+    gap = keras.layers.GlobalAveragePooling1D()(conv3)
+    output_layer = keras.layers.Dense(num_classes, activation="softmax")(gap)
+
+    model = keras.models.Model(inputs=input_layer, outputs=output_layer)
+    model.compile(
+        optimizer="adam",
+        loss="sparse_categorical_crossentropy",
+        metrics=["sparse_categorical_accuracy"],
+    )
+    return model
+
+
+def build_dataloader(config, split):
+    root_url = config.get(
+        "root_url",
+        "https://raw.githubusercontent.com/hfawaz/cd-diagram/master/FordA/",
+    )
+    if split == "train":
+        x, y = readucr(root_url + "FordA_TRAIN.tsv")
+        idx = np.random.permutation(len(x))
+        x, y = x[idx], y[idx]
+    elif split == "test":
+        x, y = readucr(root_url + "FordA_TEST.tsv")
+    else:
+        raise ValueError(f"Unknown split: {split!r}. Use 'train' or 'test'.")
+
+    x = x.reshape((x.shape[0], x.shape[1], 1))
+    y[y == -1] = 0
+
+    batch_size = config.get("batch_size", 32)
+    dataset = keras.utils.PyDataset if hasattr(keras.utils, "PyDataset") else None
+
+    n = len(x)
+    indices = np.arange(n)
+
+    class NumpyBatchGenerator(keras.utils.PyDataset if dataset else object):
+        def __len__(self):
+            return int(np.ceil(n / batch_size))
+
+        def __getitem__(self, idx):
+            batch_idx = indices[idx * batch_size:(idx + 1) * batch_size]
+            return x[batch_idx], y[batch_idx]
+
+    if dataset is not None:
+        return NumpyBatchGenerator()
+
+    # Fallback: return a plain generator of (x_batch, y_batch) tuples
+    def _gen():
+        for i in range(int(np.ceil(n / batch_size))):
+            batch_idx = indices[i * batch_size:(i + 1) * batch_size]
+            yield x[batch_idx], y[batch_idx]
+
+    return _gen, x, y
+
+
+def train_step(model, batch, optimizer, config):
+    x_batch, y_batch = batch
+
+    import tensorflow as tf
+
+    with tf.GradientTape() as tape:
+        logits = model(x_batch, training=True)
+        loss_fn = keras.losses.SparseCategoricalCrossentropy()
+        loss = loss_fn(y_batch, logits)
+
+    grads = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+    preds = tf.argmax(logits, axis=-1, output_type=tf.int32)
+    accuracy = tf.reduce_mean(
+        tf.cast(tf.equal(preds, tf.cast(y_batch, tf.int32)), tf.float32)
+    )
+
+    return {"loss": float(loss.numpy()), "accuracy": float(accuracy.numpy())}

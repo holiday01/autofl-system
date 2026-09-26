@@ -1,0 +1,163 @@
+"""
+Auto-generated FL client module.
+Original script: MONAI 3D segmentation training (UNet / DiceLoss).
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+from glob import glob
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+import monai
+from monai.data import list_data_collate
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirstd,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+
+
+# ── Dataset ─────────────────────────────────────────────────────────────
+
+def _build_file_list(data_path: str):
+    """Return (train_files, val_files) dicts from a flat directory of img/seg pairs."""
+    images = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+    segs   = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+    pairs  = [{"img": img, "seg": seg} for img, seg in zip(images, segs)]
+    if not pairs:
+        return [], []
+    split_idx = max(1, int(len(pairs) * 0.8))
+    return pairs[:split_idx], pairs[split_idx:]
+
+
+def _build_transforms(split: str, spatial_size=(96, 96, 96), num_samples=4):
+    if split == "train":
+        return Compose([
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+            RandCropByPosNegLabeld(
+                keys=["img", "seg"],
+                label_key="seg",
+                spatial_size=list(spatial_size),
+                pos=1, neg=1,
+                num_samples=num_samples,
+            ),
+            RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+        ])
+    return Compose([
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        ScaleIntensityd(keys="img"),
+    ])
+
+
+def _synthetic_file_list(tempdir: str, n: int = 20, size: int = 64):
+    """Generate synthetic NIfTI pairs into tempdir for smoke-testing."""
+    import nibabel as nib
+    from monai.data import create_test_image_3d
+    os.makedirs(tempdir, exist_ok=True)
+    for i in range(n):
+        im, seg = create_test_image_3d(size, size, size, num_seg_classes=1, channel_dim=-1)
+        nib.save(nib.Nifti1Image(im,  np.eye(4)), os.path.join(tempdir, f"img{i:d}.nii.gz"))
+        nib.save(nib.Nifti1Image(seg, np.eye(4)), os.path.join(tempdir, f"seg{i:d}.nii.gz"))
+    images = sorted(glob(os.path.join(tempdir, "img*.nii.gz")))
+    segs   = sorted(glob(os.path.join(tempdir, "seg*.nii.gz")))
+    pairs  = [{"img": img, "seg": seg} for img, seg in zip(images, segs)]
+    split_idx = max(1, int(len(pairs) * 0.8))
+    return pairs[:split_idx], pairs[split_idx:]
+
+
+# ── FL Interface ─────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    defaults = dict(
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=1,
+        channels=(16, 32, 64, 128, 256),
+        strides=(2, 2, 2, 2),
+        num_res_units=2,
+    )
+    defaults.update(kwargs)
+    return monai.networks.nets.UNet(**defaults)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 2))
+    num_workers = local.get("num_workers", config.get("num_workers", 4))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path    = config.get("data_path", ".")
+    spatial_size = tuple(config.get("spatial_size", [96, 96, 96]))
+    num_samples  = config.get("num_samples", 4)
+
+    train_files, val_files = _build_file_list(data_path)
+    if not train_files:
+        import tempfile
+        _tmpdir = config.get("_synthetic_tmpdir",
+                             tempfile.mkdtemp(prefix="autofl_monai_seg_"))
+        n_synthetic = config.get("n_synthetic", 20)
+        train_files, val_files = _synthetic_file_list(
+            _tmpdir, n=n_synthetic, size=spatial_size[0])
+
+    files     = train_files if split == "train" else val_files
+    transform = _build_transforms(split, spatial_size=spatial_size, num_samples=num_samples)
+    ds        = monai.data.Dataset(data=files, transform=transform)
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        collate_fn=list_data_collate,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list | dict,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, dict):
+        inputs = batch["img"].to(device)
+        labels = batch["seg"].to(device)
+    elif isinstance(batch, (list, tuple)):
+        inputs = batch[0].to(device) if isinstance(batch[0], torch.Tensor) else batch[0]
+        labels = batch[1].to(device) if isinstance(batch[1], torch.Tensor) else batch[1]
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs  = model(inputs)
+    criterion = monai.losses.DiceLoss(sigmoid=True)
+    loss      = criterion(outputs, labels)
+    return loss

@@ -1,0 +1,256 @@
+```python
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+try:
+    import torchvision
+    import torchvision.transforms as transforms
+    _TORCHVISION_AVAILABLE = True
+except ImportError:
+    _TORCHVISION_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Model architecture — preserved exactly from original
+# ---------------------------------------------------------------------------
+
+class Generator(nn.Module):
+    """
+    >>> Generator(img_shape=(1, 8, 8))  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    Generator(
+      (model): Sequential(...)
+    )
+    """
+
+    def __init__(self, latent_dim: int = 100, img_shape: tuple = (1, 28, 28)):
+        super().__init__()
+        self.img_shape = img_shape
+
+        def block(in_feat, out_feat, normalize=True):
+            layers = [nn.Linear(in_feat, out_feat)]
+            if normalize:
+                layers.append(nn.BatchNorm1d(out_feat, 0.8))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *block(latent_dim, 128, normalize=False),
+            *block(128, 256),
+            *block(256, 512),
+            *block(512, 1024),
+            nn.Linear(1024, int(math.prod(img_shape))),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        img = self.model(z)
+        return img.view(img.size(0), *self.img_shape)
+
+
+class Discriminator(nn.Module):
+    """
+    >>> Discriminator(img_shape=(1, 28, 28))  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    Discriminator(
+      (model): Sequential(...)
+    )
+    """
+
+    def __init__(self, img_shape):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(int(math.prod(img_shape)), 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 1),
+        )
+
+    def forward(self, img):
+        img_flat = img.view(img.size(0), -1)
+        return self.model(img_flat)
+
+
+# ---------------------------------------------------------------------------
+# FL wrapper: combines Generator + Discriminator into a single nn.Module
+# so the FL runtime can treat them as one parameter set.
+# ---------------------------------------------------------------------------
+
+class GANModule(nn.Module):
+    """Thin wrapper that houses Generator and Discriminator for FL aggregation."""
+
+    def __init__(self, img_shape: tuple = (1, 28, 28), latent_dim: int = 100):
+        super().__init__()
+        self.img_shape = img_shape
+        self.latent_dim = latent_dim
+        self.generator = Generator(latent_dim=latent_dim, img_shape=img_shape)
+        self.discriminator = Discriminator(img_shape=img_shape)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.generator(z)
+
+
+# ---------------------------------------------------------------------------
+# Internal helper — mirrors LightningModule.adversarial_loss exactly
+# ---------------------------------------------------------------------------
+
+def _adversarial_loss(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return F.binary_cross_entropy_with_logits(y_hat, y)
+
+
+# ---------------------------------------------------------------------------
+# FL interface
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate and return GANModule from config."""
+    kwargs = config.get("model_kwargs", {})
+    img_shape = tuple(kwargs.get("img_shape", (1, 28, 28)))
+    latent_dim = int(kwargs.get("latent_dim", 100))
+    return GANModule(img_shape=img_shape, latent_dim=latent_dim)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+
+    Data source priority:
+      1. Real MNIST at data_path (no download).
+      2. Real MNIST downloaded to data_path (if first attempt fails).
+      3. Synthetic TensorDataset — ONLY when allow_synthetic_data=True.
+         Raises FileNotFoundError otherwise.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    img_shape = tuple(config.get("model_kwargs", {}).get("img_shape", (1, 28, 28)))
+
+    dataset = None
+
+    if _TORCHVISION_AVAILABLE:
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)),
+        ])
+        # Attempt 1: already-present data, no network access required.
+        try:
+            dataset = torchvision.datasets.MNIST(
+                root=data_path, train=True, download=False, transform=transform
+            )
+        except Exception:
+            pass
+
+        # Attempt 2: auto-download.
+        if dataset is None:
+            try:
+                dataset = torchvision.datasets.MNIST(
+                    root=data_path, train=True, download=True, transform=transform
+                )
+            except Exception:
+                pass
+
+    if dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"MNIST dataset not found at '{data_path}' and could not be downloaded "
+                "(torchvision may be missing or the network unreachable). "
+                "Set config['allow_synthetic_data'] = True to use synthetic data as a fallback."
+            )
+        # Synthetic fallback: 1 000 random images matching img_shape, random int labels.
+        n_samples = 1000
+        images = torch.randn(n_samples, *img_shape)
+        labels = torch.randint(0, 10, (n_samples,))
+        dataset = TensorDataset(images, labels)
+
+    # Deterministic 90/10 train-val split via random_split.
+    n_total = len(dataset)
+    n_val = max(1, int(0.1 * n_total))
+    n_train = n_total - n_val
+    train_set, val_set = random_split(
+        dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen = train_set if split == "train" else val_set
+    # drop_last=True: BatchNorm1d inside Generator fails on batch size 1.
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        drop_last=True,
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    Single combined GAN forward pass.  Returns loss WITH grad attached.
+    The FL runtime is responsible for loss.backward() and optimizer.step().
+
+    Generator loss  : D(G(z)) vs all-ones  (generator wants to fool D)
+    Discriminator loss: D(real) vs 1  +  D(G(z).detach()) vs 0
+                        (D wants to tell real from fake)
+
+    fake_imgs is detached for the discriminator term so generator gradients
+    are not contaminated by the discriminator update path, mirroring the
+    toggle_optimizer logic in the original LightningModule.
+    """
+    device = next(model.parameters()).device
+
+    imgs, _ = batch
+    imgs = imgs.to(device)
+    batch_size = imgs.size(0)
+    latent_dim = model.latent_dim
+
+    # Sample latent noise — leaf tensor, no graph involvement.
+    z = torch.randn(batch_size, latent_dim, device=device)
+
+    # ---- Generator loss ------------------------------------------------
+    fake_imgs = model.generator(z)                          # graph alive for G
+    valid = torch.ones(batch_size, 1, device=device)
+    g_loss = _adversarial_loss(model.discriminator(fake_imgs), valid)
+
+    # ---- Discriminator loss --------------------------------------------
+    real_loss = _adversarial_loss(model.discriminator(imgs), valid)
+    fake = torch.zeros(batch_size, 1, device=device)
+    # Detach so D's gradient path does not propagate back through G.
+    fake_loss = _adversarial_loss(
+        model.discriminator(fake_imgs.detach()), fake
+    )
+    d_loss = (real_loss + fake_loss) / 2
+
+    # Combined loss handed to the FL runtime — grad is attached, no backward here.
+    return g_loss + d_loss
+```
+
+### Key design decisions
+
+| Concern | Decision |
+|---|---|
+| **LightningModule extraction** | `Generator` and `Discriminator` are already pure `nn.Module`; they are copied verbatim. A new `GANModule` wrapper houses both so the FL runtime handles a single parameter namespace. |
+| **Dual-optimizer → single optimizer** | The FL runtime provides one optimizer. `train_step` returns `g_loss + d_loss` as a single scalar. `fake_imgs.detach()` on the discriminator path preserves the original toggle-optimizer semantics: generator gradients flow only through `g_loss`, and discriminator gradients flow only through `d_loss`. |
+| **`train_step` contract** | One forward pass, loss tensor returned with grad attached. No `backward()`, no `optimizer.step()`. |
+| **Synthetic fallback** | Strictly gated on `config.get("allow_synthetic_data", False)`. A missing dataset raises `FileNotFoundError` with a clear message when the flag is absent or `False`. |
+| **`drop_last=True`** | `BatchNorm1d` inside `Generator` raises on batch size 1; this prevents it at the DataLoader boundary. |

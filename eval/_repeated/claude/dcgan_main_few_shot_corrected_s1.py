@@ -1,0 +1,228 @@
+"""
+Auto-generated FL client module.
+Original script: DCGAN training script (dcgan_train.py)
+
+Exposes:
+  build_model(config)                   -> GANWrapper (contains netG + netD)
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (errG, with grad_fn)
+
+CONTRACT NOTES FOR GAN:
+  - GAN training requires alternating updates: train_step handles the
+    Discriminator update internally (zero_grad → forward → backward → step
+    for netD via model._optimizerD) before computing the Generator loss.
+  - The returned loss is errG (Generator loss) WITH grad_fn attached.
+  - The FL runtime owns backward() and optimizer.step() for the Generator.
+  - Do NOT call errG.backward() inside train_step.
+  - Do NOT call the passed-in optimizer.step() or optimizer.zero_grad() here.
+  - Do NOT call .item() or .detach() on the returned loss.
+  - The optimizer passed in by the FL runtime should cover netG parameters
+    (or all GANWrapper parameters); netD is updated via its internal optimizer.
+"""
+from __future__ import annotations
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, random_split
+
+
+def _weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        torch.nn.init.normal_(m.weight, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        torch.nn.init.normal_(m.weight, 1.0, 0.02)
+        torch.nn.init.zeros_(m.bias)
+
+
+class Generator(nn.Module):
+    def __init__(self, nz: int = 100, ngf: int = 64, nc: int = 3):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.main(x)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, ndf: int = 64, nc: int = 3):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.main(x).view(-1, 1).squeeze(1)
+
+
+class GANWrapper(nn.Module):
+    """Holds Generator and Discriminator; owns the Discriminator optimizer internally."""
+
+    def __init__(
+        self,
+        nz: int = 100,
+        ngf: int = 64,
+        ndf: int = 64,
+        nc: int = 3,
+        lr: float = 0.0002,
+        beta1: float = 0.5,
+    ):
+        super().__init__()
+        self.nz = nz
+        self.netG = Generator(nz=nz, ngf=ngf, nc=nc)
+        self.netD = Discriminator(ndf=ndf, nc=nc)
+        self.netG.apply(_weights_init)
+        self.netD.apply(_weights_init)
+        # D's optimizer is internal — the FL runtime does not manage it
+        self._optimizerD = optim.Adam(
+            self.netD.parameters(), lr=lr, betas=(beta1, 0.999)
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.netG(z)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    model_kwargs = config.get("model_kwargs", {})
+    lr    = config.get("lr", 0.0002)
+    beta1 = config.get("beta1", 0.5)
+    return GANWrapper(lr=lr, beta1=beta1, **model_kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local        = config.get("local", {})
+    batch_size   = local.get("batch_size",  config.get("batch_size", 64))
+    num_workers  = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory   = local.get("pin_memory", True)
+    image_size   = config.get("image_size", 64)
+    dataset_name = config.get("dataset", "fake").lower()
+    data_path    = config.get("data_path", ".")
+
+    transform_rgb = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    transform_gray = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+    ])
+
+    if dataset_name in ('imagenet', 'folder', 'lfw'):
+        full_dataset = dset.ImageFolder(root=data_path, transform=transform_rgb)
+    elif dataset_name == 'lsun':
+        classes = [c + '_train' for c in config.get("lsun_classes", "bedroom").split(',')]
+        full_dataset = dset.LSUN(root=data_path, classes=classes, transform=transform_rgb)
+    elif dataset_name == 'cifar10':
+        full_dataset = dset.CIFAR10(root=data_path, download=True, transform=transform_rgb)
+    elif dataset_name == 'mnist':
+        full_dataset = dset.MNIST(root=data_path, download=True, transform=transform_gray)
+    else:  # fake / fallback
+        nc = config.get("model_kwargs", {}).get("nc", 3)
+        full_dataset = dset.FakeData(
+            image_size=(nc, image_size, image_size),
+            transform=transforms.ToTensor(),
+        )
+
+    val_ratio = config.get("val_ratio", 0.1)
+    n_val   = max(1, int(len(full_dataset) * val_ratio))
+    n_train = len(full_dataset) - n_val
+    train_ds, val_ds = random_split(
+        full_dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(config.get("seed", 42)),
+    )
+    ds = train_ds if split == "train" else val_ds
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+        drop_last=True,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list | dict,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    One adversarial step.  Returns errG (Generator loss) WITH grad_fn attached.
+
+    The Discriminator update is handled entirely inside this function because
+    adversarial training requires D to be updated before G's loss is computed.
+    model._optimizerD (internal to GANWrapper) is used for that update — NOT
+    the optimizer argument, which the FL runtime owns and uses for G's step.
+
+    The FL runtime calls errG.backward() and optimizer.step() externally:
+    do NOT do either here, and do NOT .detach() or .item() the returned loss.
+    """
+    assert isinstance(model, GANWrapper), f"Expected GANWrapper, got {type(model)}"
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        real_images = batch[0].to(device)
+    elif isinstance(batch, dict):
+        key = next(k for k in ("image", "x", "input") if k in batch)
+        real_images = batch[key].to(device)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    batch_size = real_images.size(0)
+    nz        = model.nz
+    criterion = nn.BCELoss()
+    real_label = torch.ones(batch_size,  dtype=real_images.dtype, device=device)
+    fake_label = torch.zeros(batch_size, dtype=real_images.dtype, device=device)
+
+    # ── Discriminator update (internal — not managed by FL runtime) ───────
+    model.netD.zero_grad()
+    errD_real = criterion(model.netD(real_images), real_label)
+    errD_real.backward()
+
+    noise = torch.randn(batch_size, nz, 1, 1, device=device)
+    fake  = model.netG(noise)
+    errD_fake = criterion(model.netD(fake.detach()), fake_label)
+    errD_fake.backward()
+    model._optimizerD.step()
+
+    # ── Generator loss — returned for FL runtime to handle ────────────────
+    noise_g = torch.randn(batch_size, nz, 1, 1, device=device)
+    fake_g  = model.netG(noise_g)
+    errG    = criterion(model.netD(fake_g), real_label)
+    return errG

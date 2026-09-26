@@ -1,0 +1,150 @@
+```python
+import os
+import random
+import numpy as np
+import tensorflow as tf
+import keras
+from keras import layers
+from scipy import ndimage
+import nibabel as nib
+
+
+def read_nifti_file(filepath):
+    scan = nib.load(filepath)
+    return scan.get_fdata()
+
+
+def normalize(volume):
+    min_val, max_val = -1000, 400
+    volume = np.clip(volume, min_val, max_val)
+    volume = (volume - min_val) / (max_val - min_val)
+    return volume.astype("float32")
+
+
+def resize_volume(img):
+    desired_depth, desired_width, desired_height = 64, 128, 128
+    depth_factor = desired_depth / img.shape[-1]
+    width_factor = desired_width / img.shape[0]
+    height_factor = desired_height / img.shape[1]
+    img = ndimage.rotate(img, 90, reshape=False)
+    img = ndimage.zoom(img, (width_factor, height_factor, depth_factor), order=1)
+    return img
+
+
+def process_scan(path):
+    volume = read_nifti_file(path)
+    volume = normalize(volume)
+    volume = resize_volume(volume)
+    return volume
+
+
+def _scipy_rotate(volume):
+    angle = random.choice([-20, -10, -5, 5, 10, 20])
+    volume = ndimage.rotate(volume, angle, reshape=False)
+    return np.clip(volume, 0, 1).astype("float32")
+
+
+def _train_preprocessing(volume, label):
+    volume = tf.numpy_function(_scipy_rotate, [volume], tf.float32)
+    volume = tf.expand_dims(volume, axis=3)
+    return volume, label
+
+
+def _val_preprocessing(volume, label):
+    volume = tf.expand_dims(volume, axis=3)
+    return volume, label
+
+
+def build_model(config):
+    width = config.get("width", 128)
+    height = config.get("height", 128)
+    depth = config.get("depth", 64)
+
+    inputs = keras.Input((width, height, depth, 1))
+    x = layers.Conv3D(filters=64, kernel_size=3, activation="relu")(inputs)
+    x = layers.MaxPool3D(pool_size=2)(x)
+    x = layers.BatchNormalization()(x)
+
+    x = layers.Conv3D(filters=64, kernel_size=3, activation="relu")(x)
+    x = layers.MaxPool3D(pool_size=2)(x)
+    x = layers.BatchNormalization()(x)
+
+    x = layers.Conv3D(filters=128, kernel_size=3, activation="relu")(x)
+    x = layers.MaxPool3D(pool_size=2)(x)
+    x = layers.BatchNormalization()(x)
+
+    x = layers.Conv3D(filters=256, kernel_size=3, activation="relu")(x)
+    x = layers.MaxPool3D(pool_size=2)(x)
+    x = layers.BatchNormalization()(x)
+
+    x = layers.GlobalAveragePooling3D()(x)
+    x = layers.Dense(units=512, activation="relu")(x)
+    x = layers.Dropout(0.3)(x)
+    outputs = layers.Dense(units=1, activation="sigmoid")(x)
+
+    return keras.Model(inputs, outputs, name="3dcnn")
+
+
+def build_dataloader(config, split):
+    data_dir = config.get("data_dir", "MosMedData")
+    batch_size = config.get("batch_size", 2)
+    train_ratio = config.get("train_ratio", 0.7)
+
+    normal_dir = os.path.join(data_dir, "CT-0")
+    abnormal_dir = os.path.join(data_dir, "CT-23")
+
+    normal_paths = [os.path.join(normal_dir, x) for x in os.listdir(normal_dir)]
+    abnormal_paths = [os.path.join(abnormal_dir, x) for x in os.listdir(abnormal_dir)]
+
+    normal_scans = np.array([process_scan(p) for p in normal_paths])
+    abnormal_scans = np.array([process_scan(p) for p in abnormal_paths])
+
+    n_train_normal = int(len(normal_scans) * train_ratio)
+    n_train_abnormal = int(len(abnormal_scans) * train_ratio)
+
+    if split == "train":
+        x = np.concatenate((abnormal_scans[:n_train_abnormal], normal_scans[:n_train_normal]), axis=0)
+        y = np.concatenate((
+            np.ones(n_train_abnormal, dtype=np.float32),
+            np.zeros(n_train_normal, dtype=np.float32),
+        ), axis=0)
+        dataset = tf.data.Dataset.from_tensor_slices((x, y))
+        dataset = (
+            dataset.shuffle(len(x))
+            .map(_train_preprocessing, num_parallel_calls=tf.data.AUTOTUNE)
+            .batch(batch_size)
+            .prefetch(2)
+        )
+    else:
+        x = np.concatenate((abnormal_scans[n_train_abnormal:], normal_scans[n_train_normal:]), axis=0)
+        y = np.concatenate((
+            np.ones(len(abnormal_scans) - n_train_abnormal, dtype=np.float32),
+            np.zeros(len(normal_scans) - n_train_normal, dtype=np.float32),
+        ), axis=0)
+        dataset = tf.data.Dataset.from_tensor_slices((x, y))
+        dataset = (
+            dataset.shuffle(len(x))
+            .map(_val_preprocessing, num_parallel_calls=tf.data.AUTOTUNE)
+            .batch(batch_size)
+            .prefetch(2)
+        )
+
+    return dataset
+
+
+def train_step(model, batch, optimizer, config):
+    volumes, labels = batch
+    loss_fn = keras.losses.BinaryCrossentropy()
+
+    with tf.GradientTape() as tape:
+        predictions = model(volumes, training=True)
+        loss = loss_fn(labels, predictions)
+
+    gradients = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+    predicted_labels = tf.cast(predictions >= 0.5, tf.float32)
+    accuracy = tf.reduce_mean(tf.cast(tf.equal(predicted_labels, tf.reshape(labels, [-1, 1])), tf.float32))
+
+    return {"loss": loss.numpy(), "accuracy": accuracy.numpy()}
+```

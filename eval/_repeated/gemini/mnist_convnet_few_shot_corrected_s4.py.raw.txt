@@ -1,0 +1,137 @@
+```python
+"""
+Auto-generated FL client module for Keras (from MNIST ConvNet).
+
+Exposes:
+  build_model(config)               -> keras.Model
+  build_dataloader(config, split)   -> tf.data.Dataset
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach() for PyTorch,
+    or manually create a tf.GradientTape context here for Keras). The FL runtime
+    will typically wrap train_step in its own tf.GradientTape to compute gradients.
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .numpy() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np
+import tensorflow as tf
+import keras
+from keras import layers
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    model_kwargs = config.get("model_kwargs", {})
+    input_shape = model_kwargs.get("input_shape", (28, 28, 1))
+    num_classes = model_kwargs.get("num_classes", 10)
+    dropout_rate = model_kwargs.get("dropout_rate", 0.5)
+
+    model = keras.Sequential(
+        [
+            keras.Input(shape=input_shape),
+            layers.Conv2D(32, kernel_size=(3, 3), activation="relu"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Flatten(),
+            layers.Dropout(dropout_rate),
+            layers.Dense(num_classes, activation="softmax"),
+        ]
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> tf.data.Dataset:
+    # Model / data parameters - reuse from build_model config
+    model_kwargs = config.get("model_kwargs", {})
+    num_classes = model_kwargs.get("num_classes", 10)
+    batch_size = config.get("batch_size", 128)
+    seed = config.get("seed", 42)  # For reproducibility
+
+    # Load the data and split it between train and test sets
+    # Keras handles downloading and caching for built-in datasets like MNIST.
+    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+
+    # Determine which dataset to use based on split
+    if split in ("train", "val"):
+        x_data, y_data = x_train, y_train
+    elif split == "test":
+        x_data, y_data = x_test, y_test
+    else:
+        raise ValueError(f"Invalid split: {split}. Must be 'train', 'val', or 'test'.")
+
+    # Preprocessing: Scale images to the [0, 1] range and expand dimensions
+    x_data = x_data.astype("float32") / 255.0
+    x_data = np.expand_dims(x_data, -1)  # Make sure images have shape (28, 28, 1)
+
+    # Convert class vectors to binary class matrices (one-hot encoding)
+    y_data = keras.utils.to_categorical(y_data, num_classes)
+
+    # Handle train/val split if split is 'train' or 'val'
+    if split in ("train", "val"):
+        val_ratio = config.get("val_ratio", 0.1)
+        n_total = len(x_data)
+        n_val = max(1, int(n_total * val_ratio))  # Ensure at least 1 sample for validation
+        n_train = n_total - n_val
+
+        rng = np.random.default_rng(seed)
+        indices = rng.permutation(n_total)
+
+        train_indices = indices[n_val:]
+        val_indices = indices[:n_val]
+
+        if split == "train":
+            x_data, y_data = x_data[train_indices], y_data[train_indices]
+        else:  # split == "val"
+            x_data, y_data = x_data[val_indices], y_data[val_indices]
+
+    # Create a tf.data.Dataset
+    dataset = tf.data.Dataset.from_tensor_slices((x_data, y_data))
+
+    if split == "train":
+        # Shuffle buffer size: typically `len(x_data)` for full shuffling,
+        # or a large number for performance (e.g., 10000 for MNIST).
+        dataset = dataset.shuffle(buffer_size=min(len(x_data), 10000), seed=seed)
+    
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)  # Optimize performance
+
+    return dataset
+
+
+def train_step(
+    model: keras.Model,
+    batch: tuple | list,  # Expected to be (inputs, targets) from tf.data.Dataset
+    optimizer: keras.optimizers.Optimizer,  # Keras optimizer instance, passed by FL runtime
+    config: dict,
+) -> tf.Tensor:
+    """
+    ONE forward pass. Returns the raw loss tensor.
+    The FL runtime calls gradient computation and optimizer.apply_gradients() externally.
+    """
+    inputs, targets = batch
+
+    # Keras models automatically handle device placement if a distribution strategy is active.
+    # Pass training=True to ensure dropout layers are active and batch normalization
+    # layers update their statistics during the forward pass.
+    outputs = model(inputs, training=True)
+
+    # The original script used `loss="categorical_crossentropy"`.
+    # Keras's CategoricalCrossentropy expects one-hot encoded targets (y_true)
+    # and model predictions (y_pred), which aligns with our preprocessing.
+    criterion = keras.losses.CategoricalCrossentropy()
+    loss = criterion(targets, outputs)
+
+    # Adhering to the contract: Do NOT call optimizer.apply_gradients() or
+    # optimizer.zero_grad() here. The FL runtime is responsible for these
+    # operations based on the returned loss tensor.
+    # The `optimizer` argument is part of the contract's signature, but not used internally.
+
+    return loss
+```

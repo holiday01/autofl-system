@@ -1,0 +1,81 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
+
+
+def build_model(config: dict) -> nn.Module:
+    device = config.get("device", "cpu")
+    return Net().to(device)
+
+
+def build_dataloader(config: dict, split: str) -> torch.utils.data.DataLoader:
+    assert split in ("train", "test"), f"split must be 'train' or 'test', got '{split}'"
+
+    is_train = split == "train"
+    batch_size = config.get("batch_size", 64) if is_train else config.get("test_batch_size", 1000)
+    data_dir = config.get("data_dir", "../data")
+    device = config.get("device", "cpu")
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+    ])
+
+    dataset = datasets.MNIST(data_dir, train=is_train, download=True, transform=transform)
+
+    loader_kwargs = {"batch_size": batch_size, "shuffle": is_train}
+    if "cuda" in str(device) or "mps" in str(device):
+        loader_kwargs.update({
+            "num_workers": 1,
+            "persistent_workers": True,
+            "pin_memory": True,
+        })
+
+    return torch.utils.data.DataLoader(dataset, **loader_kwargs)
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    device = config.get("device", "cpu")
+    model.train()
+
+    data, target = batch
+    data, target = data.to(device), target.to(device)
+
+    optimizer.zero_grad()
+    output = model(data)
+    loss = F.nll_loss(output, target)
+    loss.backward()
+    optimizer.step()
+
+    return loss

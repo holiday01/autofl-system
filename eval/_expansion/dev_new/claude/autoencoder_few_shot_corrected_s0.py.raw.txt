@@ -1,0 +1,111 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: autoencoder.py (Lightning MNIST autoencoder example)
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+
+
+class AutoEncoder(nn.Module):
+    def __init__(self, hidden_dim: int = 64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(28 * 28, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 28 * 28),
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.decoder(z)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return AutoEncoder(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    from torchvision import transforms
+    from torchvision.datasets import MNIST
+
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 32))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", "./data")
+    transform = transforms.ToTensor()
+
+    if split in ("train", "val"):
+        full_dataset = MNIST(data_path, train=True, download=True, transform=transform)
+        val_size = config.get("val_size", 5000)
+        train_size = len(full_dataset) - val_size
+        train_ds, val_ds = random_split(
+            full_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(config.get("seed", 42)),
+        )
+        ds = train_ds if split == "train" else val_ds
+    else:
+        ds = MNIST(data_path, train=False, download=True, transform=transform)
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        x = batch[0]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        x = batch.get("input", batch.get("x", batch.get("image")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    x_flat = x.view(x.size(0), -1)
+    x_reconstructed = model(x_flat)
+    loss = F.mse_loss(x_flat, x_reconstructed)
+    return loss
+```

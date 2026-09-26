@@ -1,0 +1,178 @@
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from os import path
+from typing import Optional
+
+import torch
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+from lightning.pytorch.demos.mnist_datamodule import MNIST
+from lightning.pytorch.utilities.imports import _TORCHVISION_AVAILABLE
+
+if _TORCHVISION_AVAILABLE:
+    from torchvision import transforms
+
+
+# ---------------------------------------------------------------------------
+# Original model architecture — preserved exactly
+# ---------------------------------------------------------------------------
+
+class Backbone(torch.nn.Module):
+    """
+    >>> Backbone()  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    Backbone(
+      (l1): Linear(...)
+      (l2): Linear(...)
+    )
+    """
+
+    def __init__(self, hidden_dim=128):
+        super().__init__()
+        self.l1 = torch.nn.Linear(28 * 28, hidden_dim)
+        self.l2 = torch.nn.Linear(hidden_dim, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.l1(x))
+        return torch.relu(self.l2(x))
+
+
+# ---------------------------------------------------------------------------
+# FL client interface
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate and return the Backbone model.
+
+    Args:
+        config: FL config dict.  Constructor kwargs are read from
+                config.get("model_kwargs", {}), e.g. {"hidden_dim": 256}.
+
+    Returns:
+        An initialised Backbone instance.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    return Backbone(**model_kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split.
+
+    Real-data path
+    --------------
+    Loads MNIST from *data_path* (no download).  The full training set is
+    split 90 / 10 into train / val subsets using a fixed seed so every call
+    with the same config returns consistent splits.
+
+    Synthetic-data fallback
+    -----------------------
+    If the real dataset cannot be loaded **and**
+    ``config.get("allow_synthetic_data", False)`` is True, falls back to
+    randomly generated tensors of the correct shape.  If the flag is False a
+    ``FileNotFoundError`` is raised instead — synthetic data is never used
+    silently.
+
+    Args:
+        config: FL config dict with optional keys:
+            - ``data_path``               (str, default ".")
+            - ``local.batch_size``        (int, default 16)
+            - ``allow_synthetic_data``    (bool, default False)
+        split: "train" or "val".
+
+    Returns:
+        A DataLoader for the requested split.
+    """
+    batch_size: int = config.get("local", {}).get("batch_size", 16)
+    data_path: str = config.get("data_path", ".")
+
+    # ── Try to load real MNIST ──────────────────────────────────────────────
+    real_dataset = None
+    load_error: Optional[Exception] = None
+
+    try:
+        if not _TORCHVISION_AVAILABLE:
+            raise ImportError(
+                "torchvision is required to load MNIST but is not installed."
+            )
+        real_dataset = MNIST(
+            data_path,
+            train=True,
+            download=False,
+            transform=transforms.ToTensor(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        load_error = exc
+
+    if real_dataset is not None:
+        total = len(real_dataset)
+        val_size = max(1, int(0.1 * total))
+        train_size = total - val_size
+
+        train_subset, val_subset = random_split(
+            real_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        chosen = train_subset if split == "train" else val_subset
+        return DataLoader(chosen, batch_size=batch_size, shuffle=(split == "train"))
+
+    # ── Real data unavailable ───────────────────────────────────────────────
+    if not config.get("allow_synthetic_data", False):
+        raise FileNotFoundError(
+            f"MNIST dataset not found at '{data_path}' "
+            f"(underlying error: {load_error}). "
+            "Download the dataset first, or set config['allow_synthetic_data'] = True "
+            "to use randomly generated data as a fallback (for smoke-testing only)."
+        )
+
+    # ── Synthetic fallback (opt-in only) ────────────────────────────────────
+    n_samples = 1000 if split == "train" else 200
+    x_synth = torch.randn(n_samples, 1, 28, 28)
+    y_synth = torch.randint(0, 10, (n_samples,))
+    synth_dataset = TensorDataset(x_synth, y_synth)
+    return DataLoader(synth_dataset, batch_size=batch_size, shuffle=(split == "train"))
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Run a single forward pass and return the loss tensor (grad attached).
+
+    The FL runtime is responsible for calling ``loss.backward()`` and
+    ``optimizer.step()``; this function must NOT do either.
+
+    Args:
+        model:     The Backbone instance returned by build_model.
+        batch:     A (x, y) tuple as yielded by the DataLoader.
+        optimizer: Passed in by the FL runtime; not used here.
+        config:    FL config dict (unused in this step but kept for API
+                   consistency).
+
+    Returns:
+        Scalar cross-entropy loss tensor with gradients attached.
+    """
+    device = next(model.parameters()).device
+
+    x, y = batch
+    x = x.to(device)
+    y = y.to(device)
+
+    y_hat = model(x)
+    loss = F.cross_entropy(y_hat, y)
+    return loss  # backward() and optimizer.step() handled by FL runtime

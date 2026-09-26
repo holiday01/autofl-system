@@ -1,0 +1,190 @@
+from __future__ import print_function
+from math import log10
+from os.path import exists, join, basename
+from os import makedirs, remove
+from os import listdir
+from os.path import join as path_join
+
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import torch.utils.data as data
+from torch.utils.data import DataLoader
+from torchvision.transforms import Compose, CenterCrop, ToTensor, Resize
+from PIL import Image
+from six.moves import urllib
+import tarfile
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class Net(nn.Module):
+    def __init__(self, upscale_factor):
+        super(Net, self).__init__()
+        self.relu = nn.ReLU()
+        self.conv1 = nn.Conv2d(1, 64, (5, 5), (1, 1), (2, 2))
+        self.conv2 = nn.Conv2d(64, 64, (3, 3), (1, 1), (1, 1))
+        self.conv3 = nn.Conv2d(64, 32, (3, 3), (1, 1), (1, 1))
+        self.conv4 = nn.Conv2d(32, upscale_factor ** 2, (3, 3), (1, 1), (1, 1))
+        self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
+        self._initialize_weights()
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+        x = self.pixel_shuffle(self.conv4(x))
+        return x
+
+    def _initialize_weights(self):
+        init.orthogonal_(self.conv1.weight, init.calculate_gain('relu'))
+        init.orthogonal_(self.conv2.weight, init.calculate_gain('relu'))
+        init.orthogonal_(self.conv3.weight, init.calculate_gain('relu'))
+        init.orthogonal_(self.conv4.weight)
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+def is_image_file(filename):
+    return any(filename.endswith(ext) for ext in [".png", ".jpg", ".jpeg"])
+
+
+def load_img(filepath):
+    img = Image.open(filepath).convert('YCbCr')
+    y, _, _ = img.split()
+    return y
+
+
+class DatasetFromFolder(data.Dataset):
+    def __init__(self, image_dir, input_transform=None, target_transform=None):
+        super(DatasetFromFolder, self).__init__()
+        self.image_filenames = [
+            path_join(image_dir, x) for x in listdir(image_dir) if is_image_file(x)
+        ]
+        self.input_transform = input_transform
+        self.target_transform = target_transform
+
+    def __getitem__(self, index):
+        inp = load_img(self.image_filenames[index])
+        target = inp.copy()
+        if self.input_transform:
+            inp = self.input_transform(inp)
+        if self.target_transform:
+            target = self.target_transform(target)
+        return inp, target
+
+    def __len__(self):
+        return len(self.image_filenames)
+
+
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
+
+def _download_bsd300(dest="dataset"):
+    output_image_dir = join(dest, "BSDS300/images")
+    if not exists(output_image_dir):
+        makedirs(dest)
+        url = "http://www2.eecs.berkeley.edu/Research/Projects/CS/vision/bsds/BSDS300-images.tgz"
+        data_stream = urllib.request.urlopen(url)
+        file_path = join(dest, basename(url))
+        with open(file_path, 'wb') as f:
+            f.write(data_stream.read())
+        with tarfile.open(file_path) as tar:
+            for item in tar:
+                tar.extract(item, dest)
+        remove(file_path)
+    return output_image_dir
+
+
+def _calculate_valid_crop_size(crop_size, upscale_factor):
+    return crop_size - (crop_size % upscale_factor)
+
+
+def _input_transform(crop_size, upscale_factor):
+    return Compose([
+        CenterCrop(crop_size),
+        Resize(crop_size // upscale_factor),
+        ToTensor(),
+    ])
+
+
+def _target_transform(crop_size):
+    return Compose([
+        CenterCrop(crop_size),
+        ToTensor(),
+    ])
+
+
+def _get_dataset(upscale_factor, split):
+    root_dir = _download_bsd300()
+    subdir = "train" if split == "train" else "test"
+    image_dir = join(root_dir, subdir)
+    crop_size = _calculate_valid_crop_size(256, upscale_factor)
+    return DatasetFromFolder(
+        image_dir,
+        input_transform=_input_transform(crop_size, upscale_factor),
+        target_transform=_target_transform(crop_size),
+    )
+
+
+# ---------------------------------------------------------------------------
+# FL client API
+# ---------------------------------------------------------------------------
+
+def build_model(config):
+    """
+    config keys:
+      upscale_factor (int)   – super-resolution scale factor
+      seed           (int)   – optional, default 123
+    """
+    torch.manual_seed(config.get("seed", 123))
+    model = Net(upscale_factor=config["upscale_factor"])
+    return model
+
+
+def build_dataloader(config, split):
+    """
+    config keys:
+      upscale_factor  (int)
+      batch_size      (int)  – used for train split, default 64
+      test_batch_size (int)  – used for test split, default 10
+      threads         (int)  – DataLoader num_workers, default 4
+    split: "train" | "test"
+    """
+    dataset = _get_dataset(config["upscale_factor"], split)
+    if split == "train":
+        batch_size = config.get("batch_size", 64)
+        shuffle = True
+    else:
+        batch_size = config.get("test_batch_size", 10)
+        shuffle = False
+    return DataLoader(
+        dataset=dataset,
+        num_workers=config.get("threads", 4),
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
+
+
+def train_step(model, batch, optimizer, config):
+    """
+    Performs a single gradient update on one batch.
+
+    Returns:
+      loss (float) – scalar loss value for this batch
+    """
+    device = next(model.parameters()).device
+    inp, target = batch[0].to(device), batch[1].to(device)
+
+    criterion = nn.MSELoss()
+    optimizer.zero_grad()
+    loss = criterion(model(inp), target)
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()

@@ -1,0 +1,188 @@
+"""
+Auto-generated FL client module.
+Original script: [Provided Keras MNIST script]
+
+Exposes:
+  build_model(config)               -> keras.Model
+  build_dataloader(config, split)   -> tf.data.Dataset
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np
+import tensorflow as tf
+import keras
+from keras import layers
+
+# --- Global Data Storage ---
+# For Keras/TensorFlow, it's common to load and preprocess the entire dataset once.
+# This mimics a client having its full dataset readily available.
+_global_x_train = None
+_global_y_train = None
+_global_x_test = None
+_global_y_test = None
+
+
+def _load_and_preprocess_mnist_data(config):
+    """Loads and preprocesses the MNIST dataset, caching it globally."""
+    global _global_x_train, _global_y_train, _global_x_test, _global_y_test
+
+    if _global_x_train is not None:
+        return  # Data already loaded
+
+    # Model / data parameters from config, with fallbacks to script defaults
+    num_classes = config.get("num_classes", 10)
+    input_shape = config.get("input_shape", (28, 28, 1))
+
+    # Load the data and split it between train and test sets
+    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+
+    # Scale images to the [0, 1] range
+    x_train = x_train.astype("float32") / 255
+    x_test = x_test.astype("float32") / 255
+
+    # Make sure images have the expected channel dimension if it's 1
+    # Check if the last dimension of input_shape is 1 and data is currently 3D (H, W, C)
+    if len(input_shape) == 3 and input_shape[-1] == 1 and x_train.ndim == 3:
+        x_train = np.expand_dims(x_train, -1)
+        x_test = np.expand_dims(x_test, -1)
+
+    # Convert class vectors to binary class matrices (one-hot encoding)
+    y_train = keras.utils.to_categorical(y_train, num_classes)
+    y_test = keras.utils.to_categorical(y_test, num_classes)
+
+    _global_x_train = x_train
+    _global_y_train = y_train
+    _global_x_test = x_test
+    _global_y_test = y_test
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    """
+    Builds and returns the Keras model based on the provided configuration.
+    """
+    input_shape = config.get("input_shape", (28, 28, 1))
+    num_classes = config.get("num_classes", 10)
+
+    # Extract model-specific parameters from config, with fallbacks to script defaults
+    model_kwargs = config.get("model_kwargs", {})
+    conv1_filters = model_kwargs.get("conv1_filters", 32)
+    conv2_filters = model_kwargs.get("conv2_filters", 64)
+    dropout_rate = model_kwargs.get("dropout_rate", 0.5)
+
+    model = keras.Sequential(
+        [
+            keras.Input(shape=input_shape),
+            layers.Conv2D(conv1_filters, kernel_size=(3, 3), activation="relu"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Conv2D(conv2_filters, kernel_size=(3, 3), activation="relu"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Flatten(),
+            layers.Dropout(dropout_rate),
+            layers.Dense(num_classes, activation="softmax"),
+        ]
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> tf.data.Dataset:
+    """
+    Builds and returns a tf.data.Dataset for the specified split (train, val, or test).
+    """
+    _load_and_preprocess_mnist_data(config)  # Ensure data is loaded and preprocessed
+
+    batch_size = config.get("batch_size", 128)
+    seed = config.get("seed", 42)  # For reproducibility of splits and shuffling
+
+    x_data, y_data = None, None
+
+    if split == "train":
+        # The original script uses `validation_split` during `model.fit`.
+        # For FL, `split='train'` refers to the data available for local training.
+        # We simulate the PyTorch example's explicit train/val split from the main training set.
+        val_ratio = config.get("val_ratio", 0.1)
+        n_total_train = _global_x_train.shape[0]
+        n_val = max(1, int(n_total_train * val_ratio))
+        n_train = n_total_train - n_val
+        
+        x_data = _global_x_train[:n_train]
+        y_data = _global_y_train[:n_train]
+
+    elif split == "val":
+        # Client-side validation set, typically a portion of its training data.
+        val_ratio = config.get("val_ratio", 0.1)
+        n_total_train = _global_x_train.shape[0]
+        n_val = max(1, int(n_total_train * val_ratio))
+        n_train = n_total_train - n_val
+
+        x_data = _global_x_train[n_train:]
+        y_data = _global_y_train[n_train:]
+
+    elif split == "test":
+        x_data = _global_x_test
+        y_data = _global_y_test
+    else:
+        raise ValueError(f"Unknown split: {split}. Expected 'train', 'val', or 'test'.")
+
+    # Convert numpy arrays to tf.data.Dataset for efficient processing
+    dataset = tf.data.Dataset.from_tensor_slices((x_data, y_data))
+
+    if split == "train":
+        dataset = dataset.shuffle(
+            buffer_size=x_data.shape[0],  # Shuffle the entire dataset
+            seed=seed,
+            reshuffle_each_iteration=True
+        )
+    
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE) # Pre-fetch data for performance
+
+    return dataset
+
+
+def train_step(
+    model: keras.Model,
+    batch: tuple,  # Expected format: (inputs, targets)
+    optimizer: keras.optimizers.Optimizer,
+    config: dict,
+) -> tf.Tensor:
+    """
+    Performs one forward pass and computes the loss.
+    Returns the raw loss tensor, from which gradients can be derived by the FL runtime.
+    Adheres strictly to the contract: no backward pass, no optimizer steps within this function.
+    """
+    inputs, targets = batch
+
+    # Ensure inputs and targets are TensorFlow tensors
+    inputs = tf.convert_to_tensor(inputs, dtype=tf.float32)
+    # y_train/y_test are already float32 from `to_categorical`
+    targets = tf.convert_to_tensor(targets, dtype=tf.float32) 
+
+    # Instantiate the loss function (using config or default from original script)
+    loss_name = config.get("loss", "categorical_crossentropy")
+    if loss_name == "categorical_crossentropy":
+        criterion = keras.losses.CategoricalCrossentropy()
+    else:
+        # Add other Keras losses as needed if the FL config supports them
+        raise ValueError(f"Unsupported loss function: {loss_name}")
+
+    with tf.GradientTape() as tape:
+        # Perform forward pass. `training=True` enables dropout, batch norm updates.
+        outputs = model(inputs, training=True)
+        loss = criterion(targets, outputs)
+    
+    # The FL runtime is responsible for computing and applying gradients,
+    # as well as calling optimizer.step(). We only return the loss tensor.
+    # The `tf.Tensor` returned by `criterion` within `tf.GradientTape` context
+    # is capable of gradient tracing, fulfilling the "grad_fn attached" requirement
+    # for TensorFlow.
+    return loss

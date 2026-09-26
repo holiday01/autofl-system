@@ -1,0 +1,57 @@
+# coding: utf-8
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+
+def build_model(config: dict) -> lgb.LGBMRegressor:
+    return lgb.LGBMRegressor(
+        num_leaves=config.get("num_leaves", 31),
+        learning_rate=config.get("learning_rate", 0.05),
+        n_estimators=config.get("n_estimators", 20),
+    )
+
+
+def build_dataloader(config: dict, split: str) -> tuple[np.ndarray, np.ndarray]:
+    data_dir = Path(config["data_dir"])
+    filename = "regression.train" if split == "train" else "regression.test"
+    df = pd.read_csv(str(data_dir / filename), header=None, sep="\t")
+    y = df[0].to_numpy()
+    X = df.drop(0, axis=1).to_numpy()
+    return X, y
+
+
+def train_step(
+    model: lgb.LGBMRegressor,
+    batch: tuple[np.ndarray, np.ndarray],
+    optimizer: None,
+    config: dict,
+) -> dict:
+    X_train, y_train = batch
+
+    eval_data = config.get("eval_data")
+    callbacks = []
+    early_stopping_rounds = config.get("early_stopping_rounds")
+    if early_stopping_rounds is not None:
+        callbacks.append(lgb.early_stopping(early_stopping_rounds))
+
+    fit_kwargs: dict = {"eval_metric": config.get("eval_metric", "l1")}
+    if eval_data is not None:
+        X_val, y_val = eval_data
+        fit_kwargs["eval_set"] = [(X_val, y_val)]
+    if callbacks:
+        fit_kwargs["callbacks"] = callbacks
+
+    model.fit(X_train, y_train, **fit_kwargs)
+
+    best_iteration = getattr(model, "best_iteration_", model.n_estimators)
+    y_pred = model.predict(X_train, num_iteration=best_iteration)
+    train_rmse = float(np.sqrt(np.mean((y_pred - y_train) ** 2)))
+
+    return {
+        "train_rmse": train_rmse,
+        "best_iteration": best_iteration,
+        "feature_importances": model.feature_importances_.tolist(),
+    }

@@ -1,0 +1,259 @@
+"""
+Auto-generated FL client module.
+Original script: Keras image classification from scratch (Cats vs Dogs).
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
+import torchvision.transforms as T
+from PIL import Image
+
+
+class SeparableConv2d(nn.Module):
+    """Depthwise-separable convolution (Keras SeparableConv2D equivalent)."""
+
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0, bias=False):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size,
+            padding=padding, groups=in_channels, bias=bias,
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
+
+class MiniXception(nn.Module):
+    """
+    PyTorch port of the mini Xception network from the Keras Cats vs Dogs example.
+    Input: (B, 3, H, W) float32 in [0, 1] (pre-normalised by ToTensor transform).
+    Output: (B, 1) logits for binary classification (Cat=0, Dog=1).
+    For num_classes > 2 the final layer has num_classes units.
+    """
+
+    def __init__(self, input_channels=3, num_classes=2, dropout=0.25):
+        super().__init__()
+
+        self.entry_conv = nn.Conv2d(input_channels, 128, 3, stride=2, padding=1, bias=False)
+        self.entry_bn   = nn.BatchNorm2d(128)
+
+        self.res_blocks    = nn.ModuleList()
+        self.res_shortcuts = nn.ModuleList()
+        in_ch = 128
+        for out_ch in [256, 512, 728]:
+            self.res_blocks.append(nn.Sequential(
+                nn.ReLU(),
+                SeparableConv2d(in_ch, out_ch, 3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(),
+                SeparableConv2d(out_ch, out_ch, 3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.MaxPool2d(3, stride=2, padding=1),
+            ))
+            self.res_shortcuts.append(
+                nn.Conv2d(in_ch, out_ch, 1, stride=2, bias=False)
+            )
+            in_ch = out_ch
+
+        self.top_conv = nn.Sequential(
+            SeparableConv2d(728, 1024, 3, padding=1),
+            nn.BatchNorm2d(1024),
+            nn.ReLU(),
+        )
+        self.pool       = nn.AdaptiveAvgPool2d(1)
+        self.dropout    = nn.Dropout(dropout)
+        units           = 1 if num_classes == 2 else num_classes
+        self.classifier = nn.Linear(1024, units)
+
+    def forward(self, x):
+        x = F.relu(self.entry_bn(self.entry_conv(x)))
+
+        for block, shortcut in zip(self.res_blocks, self.res_shortcuts):
+            residual = shortcut(x)
+            x = block(x)
+            x = x + residual
+
+        x = self.top_conv(x)
+        x = self.pool(x).flatten(1)
+        x = self.dropout(x)
+        return self.classifier(x)
+
+
+class CatsDogsDataset(Dataset):
+    """
+    Load images from a PetImages-style directory (one sub-folder per class).
+    Skips files that do not have a JFIF header, matching the original script's
+    corruption filter.
+    """
+
+    def __init__(self, root: str):
+        self.samples: list[tuple[str, int]] = []
+        class_dirs = sorted(
+            d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
+        )
+        for label_idx, class_name in enumerate(class_dirs):
+            class_path = os.path.join(root, class_name)
+            for fname in os.listdir(class_path):
+                if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                    continue
+                fpath = os.path.join(class_path, fname)
+                try:
+                    with open(fpath, "rb") as f:
+                        header = f.read(10)
+                    if b"JFIF" in header:
+                        self.samples.append((fpath, label_idx))
+                except OSError:
+                    continue
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        fpath, label = self.samples[idx]
+        return Image.open(fpath).convert("RGB"), label
+
+
+class _TransformedSubset(Dataset):
+    """Wraps a random_split Subset with a per-split transform."""
+
+    def __init__(self, subset, transform):
+        self.subset    = subset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        img, label = self.subset[idx]  # img is a PIL Image from CatsDogsDataset
+        return self.transform(img), torch.tensor(label, dtype=torch.long)
+
+
+class _SyntheticImageDataset(Dataset):
+    """Synthetic stand-in for integration tests; gated by allow_synthetic_data."""
+
+    def __init__(self, n=200, image_size=(180, 180), num_classes=2):
+        self.x = torch.rand(n, 3, image_size[0], image_size[1])  # [0, 1]
+        self.y = torch.randint(0, num_classes, (n,))
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return MiniXception(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size",  config.get("batch_size",  32))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory",  True)
+
+    image_size  = tuple(config.get("image_size", (180, 180)))
+    val_ratio   = config.get("val_ratio", 0.2)
+    data_path   = config.get("data_path", "PetImages")
+
+    # Keras RandomRotation(0.1) = ±10 % of full circle = ±36 degrees
+    train_transform = T.Compose([
+        T.Resize(image_size),
+        T.RandomHorizontalFlip(),
+        T.RandomRotation(degrees=36),
+        T.ToTensor(),           # uint8 [0,255] -> float32 [0,1]
+    ])
+    val_transform = T.Compose([
+        T.Resize(image_size),
+        T.ToTensor(),
+    ])
+
+    if os.path.isdir(data_path):
+        full_dataset = CatsDogsDataset(data_path)
+        if len(full_dataset) > 0:
+            n_val   = max(1, int(len(full_dataset) * val_ratio))
+            n_train = len(full_dataset) - n_val
+            train_sub, val_sub = random_split(
+                full_dataset, [n_train, n_val],
+                generator=torch.Generator().manual_seed(config.get("seed", 1337)),
+            )
+            ds = (_TransformedSubset(train_sub, train_transform)
+                  if split == "train"
+                  else _TransformedSubset(val_sub, val_transform))
+            return DataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=(split == "train"),
+                num_workers=num_workers,
+                pin_memory=pin_memory and torch.cuda.is_available(),
+            )
+
+    # Real data unavailable or empty — check flag before falling back
+    if not config.get("allow_synthetic_data", False):
+        raise FileNotFoundError(
+            f"No valid images found at '{data_path}' and "
+            "'allow_synthetic_data' is False."
+        )
+
+    num_classes = config.get("model_kwargs", {}).get("num_classes", 2)
+    ds = _SyntheticImageDataset(
+        n=config.get("synthetic_n", 200),
+        image_size=image_size,
+        num_classes=num_classes,
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch   = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch   = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                   for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)          # (B, 1) logits
+    # BCEWithLogitsLoss matches Keras BinaryCrossentropy(from_logits=True)
+    criterion = nn.BCEWithLogitsLoss()
+    loss = criterion(outputs.squeeze(1), targets.float())
+    return loss

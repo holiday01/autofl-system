@@ -1,0 +1,136 @@
+"""
+Auto-generated FL client module.
+Original script: MONAI 3-D classification (IXI-T1 gender classification).
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+
+import monai
+from monai.data import ImageDataset
+from monai.transforms import Compose, EnsureChannelFirst, RandRotate90, Resize, ScaleIntensity
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    spatial_dims = kwargs.get("spatial_dims", 3)
+    in_channels  = kwargs.get("in_channels", 1)
+    out_channels = kwargs.get("out_channels", 2)
+    return monai.networks.nets.DenseNet121(
+        spatial_dims=spatial_dims,
+        in_channels=in_channels,
+        out_channels=out_channels,
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 2))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get(
+        "data_path",
+        os.sep.join([".", "workspace", "data", "medical", "ixi", "IXI-T1"]),
+    )
+
+    image_files = config.get("image_files", None)
+    labels      = config.get("labels", None)
+
+    if image_files is None or labels is None:
+        raise ValueError(
+            "config must contain 'image_files' (list of paths) and 'labels' (list of ints)"
+        )
+
+    image_files = [os.path.join(data_path, f) if not os.path.isabs(f) else f
+                   for f in image_files]
+    labels_arr = np.array(labels, dtype=np.int64)
+
+    spatial_size = config.get("spatial_size", [96, 96, 96])
+
+    train_transforms = Compose([
+        ScaleIntensity(),
+        EnsureChannelFirst(),
+        Resize(spatial_size),
+        RandRotate90(),
+    ])
+    val_transforms = Compose([
+        ScaleIntensity(),
+        EnsureChannelFirst(),
+        Resize(spatial_size),
+    ])
+
+    val_ratio = config.get("val_ratio", 0.5)
+    n_total   = len(image_files)
+    n_train   = max(1, int(n_total * (1.0 - val_ratio)))
+
+    if split == "train":
+        ds = ImageDataset(
+            image_files=image_files[:n_train],
+            labels=labels_arr[:n_train],
+            transform=train_transforms,
+        )
+        shuffle = True
+    else:
+        ds = ImageDataset(
+            image_files=image_files[n_train:],
+            labels=labels_arr[n_train:],
+            transform=val_transforms,
+        )
+        shuffle = False
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(outputs, targets)
+    return loss

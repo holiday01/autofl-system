@@ -1,0 +1,221 @@
+"""
+Auto-generated FL client module.
+Original script: dcgan_train.py
+
+Exposes:
+  build_model(config)                   -> GANWrapper (nn.Module)
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (GAN-specific):
+  - model is a GANWrapper; access .netG and .netD for the individual networks.
+  - optimizer must be a dict: {"G": <optimizer_for_netG>, "D": <optimizer_for_netD>}.
+  - train_step returns combined loss (errD + errG) WITH grad_fn attached.
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() or .detach() on the returned loss.
+  - The FL runtime owns backward(), step(), and metric extraction.
+  - Returning a single combined loss means D and G receive simultaneous gradient
+    updates — a common FL GAN approximation vs. the original alternating schedule.
+"""
+import torch
+import torch.nn as nn
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        nn.init.normal_(m.weight, 0.0, 0.02)
+    elif classname.find("BatchNorm") != -1:
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        nn.init.zeros_(m.bias)
+
+
+class Generator(nn.Module):
+    def __init__(self, nz: int = 100, ngf: int = 64, nc: int = 3):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(nz,      ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 2, ngf,     4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf,     nc,      4, 2, 1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, ndf: int = 64, nc: int = 3):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(nc,      ndf,     4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf,     ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 8, 1,       4, 1, 0, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.main(x).view(-1, 1).squeeze(1)
+
+
+class GANWrapper(nn.Module):
+    """Holds Generator and Discriminator as named submodules for the FL runtime."""
+
+    def __init__(self, netG: Generator, netD: Discriminator):
+        super().__init__()
+        self.netG = netG
+        self.netD = netD
+
+    def forward(self, x):
+        raise NotImplementedError("Access .netG / .netD directly; do not call GANWrapper.forward().")
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> GANWrapper:
+    nz  = config.get("nz",  100)
+    ngf = config.get("ngf",  64)
+    ndf = config.get("ndf",  64)
+    nc  = config.get("nc",    3)
+    netG = Generator(nz=nz, ngf=ngf, nc=nc)
+    netD = Discriminator(ndf=ndf, nc=nc)
+    netG.apply(weights_init)
+    netD.apply(weights_init)
+    return GANWrapper(netG, netD)
+
+
+def build_dataloader(config: dict, split: str = "train") -> torch.utils.data.DataLoader:
+    local        = config.get("local", {})
+    batch_size   = local.get("batch_size",  config.get("batch_size",  64))
+    num_workers  = local.get("num_workers", config.get("num_workers",  2))
+    pin_memory   = local.get("pin_memory",  True)
+
+    dataset_name = config.get("dataset",    "fake").lower()
+    dataroot     = config.get("dataroot",   ".")
+    image_size   = config.get("image_size",  64)
+    nc           = config.get("nc",           3)
+
+    norm_rgb  = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    norm_gray = transforms.Normalize((0.5,), (0.5,))
+
+    if dataset_name in ("imagenet", "folder", "lfw"):
+        dataset = dset.ImageFolder(
+            root=dataroot,
+            transform=transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                norm_rgb,
+            ]),
+        )
+    elif dataset_name == "lsun":
+        classes = [c + "_train" for c in config.get("lsun_classes", "bedroom").split(",")]
+        dataset = dset.LSUN(
+            root=dataroot,
+            classes=classes,
+            transform=transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                norm_rgb,
+            ]),
+        )
+    elif dataset_name == "cifar10":
+        dataset = dset.CIFAR10(
+            root=dataroot,
+            download=True,
+            transform=transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.ToTensor(),
+                norm_rgb,
+            ]),
+        )
+    elif dataset_name == "mnist":
+        dataset = dset.MNIST(
+            root=dataroot,
+            download=True,
+            transform=transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.ToTensor(),
+                norm_gray,
+            ]),
+        )
+    else:  # fake / fallback
+        dataset = dset.FakeData(
+            image_size=(nc, image_size, image_size),
+            transform=transforms.ToTensor(),
+        )
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+        drop_last=True,
+    )
+
+
+def train_step(
+    model: GANWrapper,
+    batch: tuple | list | dict,
+    optimizer: dict,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE combined GAN forward pass.  Returns errD + errG WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer["G"]/.["D"].step() externally.
+    Do NOT call backward(), step(), zero_grad(), .detach(), or .item() here.
+
+    optimizer must be a dict: {"G": <optimizer_for_netG>, "D": <optimizer_for_netD>}
+    """
+    device = next(model.parameters()).device
+    nz = config.get("nz", 100)
+
+    if isinstance(batch, (list, tuple)):
+        real_images = batch[0].to(device)
+    elif isinstance(batch, dict):
+        real_images = batch.get("image", batch.get("x", batch.get("input"))).to(device)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    batch_size = real_images.size(0)
+    criterion  = nn.BCELoss()
+    real_label = torch.ones( batch_size, dtype=real_images.dtype, device=device)
+    fake_label = torch.zeros(batch_size, dtype=real_images.dtype, device=device)
+
+    # D on real
+    errD_real = criterion(model.netD(real_images), real_label)
+
+    # D on fake (detach fake so G gets no gradient through this path)
+    noise = torch.randn(batch_size, nz, 1, 1, device=device)
+    fake  = model.netG(noise)
+    errD_fake = criterion(model.netD(fake.detach()), fake_label)
+
+    # G: fool D (fake not detached — gradient flows back to netG)
+    errG = criterion(model.netD(fake), real_label)
+
+    return errD_real + errD_fake + errG

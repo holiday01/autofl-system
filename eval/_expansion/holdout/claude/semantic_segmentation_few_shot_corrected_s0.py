@@ -1,0 +1,231 @@
+"""
+Auto-generated FL client module.
+Original script: KITTI semantic segmentation with U-Net (Lightning-based).
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import random
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+
+DEFAULT_VOID_LABELS = (0, 1, 2, 3, 4, 5, 6, 9, 10, 14, 15, 16, 18, 29, 30, -1)
+DEFAULT_VALID_LABELS = (7, 8, 11, 12, 13, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33)
+
+
+class KITTI(Dataset):
+    IMAGE_PATH = os.path.join("training", "image_2")
+    MASK_PATH = os.path.join("training", "semantic")
+
+    def __init__(
+        self,
+        data_path: str,
+        split: str,
+        img_size: tuple = (1242, 376),
+        void_labels: list = DEFAULT_VOID_LABELS,
+        valid_labels: list = DEFAULT_VALID_LABELS,
+        transform=None,
+    ):
+        self.img_size = img_size
+        self.void_labels = void_labels
+        self.valid_labels = valid_labels
+        self.ignore_index = 250
+        self.class_map = dict(zip(self.valid_labels, range(len(self.valid_labels))))
+        self.transform = transform
+        self.split = split
+        self.data_path = data_path
+        self.img_path = os.path.join(self.data_path, self.IMAGE_PATH)
+        self.mask_path = os.path.join(self.data_path, self.MASK_PATH)
+        self.img_list = self.get_filenames(self.img_path)
+        self.mask_list = self.get_filenames(self.mask_path)
+
+        random_inst = random.Random(12345)
+        n_items = len(self.img_list)
+        idxs = random_inst.sample(range(n_items), n_items // 5)
+        if self.split == "train":
+            idxs = [idx for idx in range(n_items) if idx not in idxs]
+        self.img_list = [self.img_list[i] for i in idxs]
+        self.mask_list = [self.mask_list[i] for i in idxs]
+
+    def __len__(self):
+        return len(self.img_list)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.img_list[idx])
+        img = img.resize(self.img_size)
+        img = torch.tensor(img)
+
+        mask = Image.open(self.mask_list[idx]).convert("L")
+        mask = mask.resize(self.img_size)
+        mask = torch.tensor(mask)
+        mask = self.encode_segmap(mask)
+
+        if self.transform:
+            img = self.transform(img)
+
+        return img, mask
+
+    def encode_segmap(self, mask):
+        for voidc in self.void_labels:
+            mask[mask == voidc] = self.ignore_index
+        for validc in self.valid_labels:
+            mask[mask == validc] = self.class_map[validc]
+        mask[mask > 18] = self.ignore_index
+        return mask
+
+    def get_filenames(self, path):
+        files_list = []
+        for filename in os.listdir(path):
+            files_list.append(os.path.join(path, filename))
+        return files_list
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Down(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.net = nn.Sequential(nn.MaxPool2d(kernel_size=2, stride=2), DoubleConv(in_ch, out_ch))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Up(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, bilinear: bool = False):
+        super().__init__()
+        if bilinear:
+            self.upsample = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+                nn.Conv2d(in_ch, in_ch // 2, kernel_size=1),
+            )
+        else:
+            self.upsample = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
+        self.conv = DoubleConv(in_ch, out_ch)
+
+    def forward(self, x1, x2):
+        x1 = self.upsample(x1)
+        diff_h = x2.shape[2] - x1.shape[2]
+        diff_w = x2.shape[3] - x1.shape[3]
+        x1 = F.pad(x1, [diff_w // 2, diff_w - diff_w // 2, diff_h // 2, diff_h - diff_h // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class UNet(nn.Module):
+    def __init__(self, num_classes: int = 19, num_layers: int = 5, features_start: int = 64, bilinear: bool = False):
+        super().__init__()
+        self.num_layers = num_layers
+        layers = [DoubleConv(3, features_start)]
+        feats = features_start
+        for _ in range(num_layers - 1):
+            layers.append(Down(feats, feats * 2))
+            feats *= 2
+        for _ in range(num_layers - 1):
+            layers.append(Up(feats, feats // 2, bilinear))
+            feats //= 2
+        layers.append(nn.Conv2d(feats, num_classes, kernel_size=1))
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x):
+        xi = [self.layers[0](x)]
+        for layer in self.layers[1 : self.num_layers]:
+            xi.append(layer(xi[-1]))
+        for i, layer in enumerate(self.layers[self.num_layers : -1]):
+            xi[-1] = layer(xi[-1], xi[-2 - i])
+        return self.layers[-1](xi[-1])
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return UNet(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 4))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", ".")
+    dataset_kwargs = config.get("dataset_kwargs", {})
+    img_size = tuple(dataset_kwargs.get("img_size", (1242, 376)))
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.35675976, 0.37380189, 0.3764753],
+            std=[0.32064945, 0.32098866, 0.32325324],
+        ),
+    ])
+
+    ds = KITTI(data_path, split=split, img_size=img_size, transform=transform)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    inputs = inputs.float()
+    targets = targets.long()
+    outputs = model(inputs)
+    loss = F.cross_entropy(outputs, targets, ignore_index=250)
+    return loss

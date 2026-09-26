@@ -1,0 +1,9 @@
+# ============================================================
+# Site-2 local config (RTX 5070, 12GB VRAM)
+# Only keys in global allowed_overrides are accepted.
+# ============================================================
+batch_size: 16
+num_workers: 4
+use_amp: true
+gradient_accumulation: 2
+pin_memory: true

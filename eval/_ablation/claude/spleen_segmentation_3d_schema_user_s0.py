@@ -1,0 +1,142 @@
+import logging
+import os
+import sys
+import tempfile
+from glob import glob
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, random_split
+from torch.utils.tensorboard import SummaryWriter
+
+import monai
+from monai.data import create_test_image_3d, list_data_collate, decollate_batch
+from monai.inferers import sliding_window_inference
+from monai.metrics import DiceMetric
+from monai.transforms import (
+    Activations,
+    EnsureChannelFirstd,
+    AsDiscrete,
+    Compose,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+from monai.visualize import plot_2d_or_3d_image
+
+
+class _SyntheticSegDataset(torch.utils.data.Dataset):
+    def __init__(self, length=40, spatial_size=(96, 96, 96)):
+        self.length = length
+        self.spatial_size = spatial_size
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        img = torch.randn(1, *self.spatial_size)
+        seg = torch.randint(0, 2, (1, *self.spatial_size)).float()
+        return {"img": img, "seg": seg}
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return monai.networks.nets.UNet(
+        spatial_dims=kwargs.get("spatial_dims", 3),
+        in_channels=kwargs.get("in_channels", 1),
+        out_channels=kwargs.get("out_channels", 1),
+        channels=kwargs.get("channels", (16, 32, 64, 128, 256)),
+        strides=kwargs.get("strides", (2, 2, 2, 2)),
+        num_res_units=kwargs.get("num_res_units", 2),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+
+    images = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+    segs = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+
+    if not images or not segs:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"No NIfTI image/seg pairs (img*.nii.gz / seg*.nii.gz) found at '{data_path}'. "
+                "Set config['allow_synthetic_data']=True to use synthetic data."
+            )
+        synth_ds = _SyntheticSegDataset(length=40)
+        n_val = max(1, round(0.2 * len(synth_ds)))
+        n_train = len(synth_ds) - n_val
+        generator = torch.Generator().manual_seed(42)
+        train_ds, val_ds = random_split(synth_ds, [n_train, n_val], generator=generator)
+        chosen = train_ds if split == "train" else val_ds
+        return DataLoader(
+            chosen,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+            num_workers=0,
+        )
+
+    all_files = [{"img": img, "seg": seg} for img, seg in zip(images, segs)]
+    n_total = len(all_files)
+    n_val = max(1, round(0.2 * n_total))
+    n_train = n_total - n_val
+
+    train_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+            RandCropByPosNegLabeld(
+                keys=["img", "seg"],
+                label_key="seg",
+                spatial_size=[96, 96, 96],
+                pos=1,
+                neg=1,
+                num_samples=4,
+            ),
+            RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+        ]
+    )
+    val_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+        ]
+    )
+
+    generator = torch.Generator().manual_seed(42)
+    full_ds = monai.data.Dataset(data=all_files, transform=train_transforms)
+    train_subset, val_placeholder = random_split(full_ds, [n_train, n_val], generator=generator)
+
+    if split == "train":
+        return DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            collate_fn=list_data_collate,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+    val_files = [all_files[i] for i in val_placeholder.indices]
+    val_ds = monai.data.Dataset(data=val_files, transform=val_transforms)
+    return DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=4,
+        collate_fn=list_data_collate,
+    )
+
+
+def train_step(model, batch, optimizer, config: dict) -> torch.Tensor:
+    device = next(model.parameters()).device
+    inputs = batch["img"].to(device)
+    labels = batch["seg"].to(device)
+    loss_fn = monai.losses.DiceLoss(sigmoid=True)
+    outputs = model(inputs)
+    return loss_fn(outputs, labels)

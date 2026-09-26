@@ -1,0 +1,84 @@
+```python
+from __future__ import print_function
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.rnn = nn.LSTM(input_size=28, hidden_size=64, batch_first=True)
+        self.batchnorm = nn.BatchNorm1d(64)
+        self.dropout1 = nn.Dropout2d(0.25)
+        self.dropout2 = nn.Dropout2d(0.5)
+        self.fc1 = nn.Linear(64, 32)
+        self.fc2 = nn.Linear(32, 10)
+
+    def forward(self, input):
+        input = input.reshape(-1, 28, 28)
+        output, hidden = self.rnn(input)
+        output = output[:, -1, :]
+        output = self.batchnorm(output)
+        output = self.dropout1(output)
+        output = self.fc1(output)
+        output = F.relu(output)
+        output = self.dropout2(output)
+        output = self.fc2(output)
+        output = F.log_softmax(output, dim=1)
+        return output
+
+
+def build_model(config):
+    device = config.get("device", "cpu")
+    model = Net().to(device)
+    return model
+
+
+def build_dataloader(config, split):
+    assert split in ("train", "test"), f"split must be 'train' or 'test', got {split!r}"
+
+    is_train = split == "train"
+    batch_size = config.get("batch_size", 64) if is_train else config.get("test_batch_size", 1000)
+    data_dir = config.get("data_dir", "../data")
+    num_workers = config.get("num_workers", 1)
+    pin_memory = config.get("pin_memory", False)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+    ])
+
+    dataset = datasets.MNIST(
+        data_dir,
+        train=is_train,
+        download=True,
+        transform=transform,
+    )
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=is_train,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
+def train_step(model, batch, optimizer, config):
+    device = config.get("device", "cpu")
+    model.train()
+
+    data, target = batch
+    data, target = data.to(device), target.to(device)
+
+    optimizer.zero_grad()
+    output = model(data)
+    loss = F.nll_loss(output, target)
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()
+```

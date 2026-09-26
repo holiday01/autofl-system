@@ -1,0 +1,250 @@
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+os.environ["KERAS_BACKEND"] = "jax"
+
+import numpy as np
+import tensorflow as tf
+import keras
+from keras import ops
+
+from medicai.losses import BinaryDiceCELoss
+from medicai.metrics import BinaryDiceMetric
+from medicai.models import SwinUNETR
+from medicai.transforms import (
+    Compose,
+    CropForeground,
+    NormalizeIntensity,
+    RandFlip,
+    RandShiftIntensity,
+    RandSpatialCrop,
+    TensorBundle,
+)
+
+
+class ConvertToMultiChannelBasedOnBratsClasses:
+    def __init__(self, keys):
+        self.keys = keys
+
+    def __call__(self, inputs):
+        if isinstance(inputs, dict):
+            inputs = TensorBundle(inputs)
+        for key in self.keys:
+            data = inputs[key]
+            tc = tf.logical_or(tf.equal(data, 1), tf.equal(data, 4))
+            wt = tf.logical_or(tc, tf.equal(data, 2))
+            et = tf.equal(data, 4)
+            stacked = tf.stack(
+                [tf.cast(tc, tf.float32), tf.cast(wt, tf.float32), tf.cast(et, tf.float32)],
+                axis=-1,
+            )
+            inputs[key] = stacked
+        return inputs
+
+
+def _rearrange_shape(sample):
+    image = sample["image"]
+    label = sample["label"]
+    affine = sample["affine"]
+    image = tf.transpose(image, perm=[2, 1, 0, 3])
+    label = tf.transpose(label, perm=[2, 1, 0])
+    cols = tf.gather(affine, [2, 1, 0], axis=1)
+    affine = tf.concat([cols, affine[:, 3:]], axis=1)
+    sample["image"] = image
+    sample["label"] = label
+    sample["affine"] = affine
+    return sample
+
+
+def _parse_tfrecord_fn(example_proto):
+    feature_description = {
+        "flair_raw": tf.io.FixedLenFeature([], tf.string),
+        "t1_raw": tf.io.FixedLenFeature([], tf.string),
+        "t1ce_raw": tf.io.FixedLenFeature([], tf.string),
+        "t2_raw": tf.io.FixedLenFeature([], tf.string),
+        "label_raw": tf.io.FixedLenFeature([], tf.string),
+        "flair_shape": tf.io.FixedLenFeature([3], tf.int64),
+        "t1_shape": tf.io.FixedLenFeature([3], tf.int64),
+        "t1ce_shape": tf.io.FixedLenFeature([3], tf.int64),
+        "t2_shape": tf.io.FixedLenFeature([3], tf.int64),
+        "label_shape": tf.io.FixedLenFeature([3], tf.int64),
+        "flair_affine": tf.io.FixedLenFeature([16], tf.float32),
+        "t1_affine": tf.io.FixedLenFeature([16], tf.float32),
+        "t1ce_affine": tf.io.FixedLenFeature([16], tf.float32),
+        "t2_affine": tf.io.FixedLenFeature([16], tf.float32),
+        "label_affine": tf.io.FixedLenFeature([16], tf.float32),
+        "flair_pixdim": tf.io.FixedLenFeature([8], tf.float32),
+        "t1_pixdim": tf.io.FixedLenFeature([8], tf.float32),
+        "t1ce_pixdim": tf.io.FixedLenFeature([8], tf.float32),
+        "t2_pixdim": tf.io.FixedLenFeature([8], tf.float32),
+        "label_pixdim": tf.io.FixedLenFeature([8], tf.float32),
+        "flair_filename": tf.io.FixedLenFeature([], tf.string),
+        "t1_filename": tf.io.FixedLenFeature([], tf.string),
+        "t1ce_filename": tf.io.FixedLenFeature([], tf.string),
+        "t2_filename": tf.io.FixedLenFeature([], tf.string),
+        "label_filename": tf.io.FixedLenFeature([], tf.string),
+    }
+    example = tf.io.parse_single_example(example_proto, feature_description)
+
+    flair = tf.reshape(tf.io.decode_raw(example["flair_raw"], tf.float32), example["flair_shape"])
+    t1 = tf.reshape(tf.io.decode_raw(example["t1_raw"], tf.float32), example["t1_shape"])
+    t1ce = tf.reshape(tf.io.decode_raw(example["t1ce_raw"], tf.float32), example["t1ce_shape"])
+    t2 = tf.reshape(tf.io.decode_raw(example["t2_raw"], tf.float32), example["t2_shape"])
+    label = tf.reshape(tf.io.decode_raw(example["label_raw"], tf.float32), example["label_shape"])
+    flair_affine = tf.reshape(example["flair_affine"], (4, 4))
+
+    image = tf.concat([flair[..., None], t1[..., None], t1ce[..., None], t2[..., None]], axis=-1)
+    return {"image": image, "label": label, "affine": flair_affine}
+
+
+def _train_transformation(sample):
+    roi_size = (96, 96, 96)
+    meta = {"affine": sample["affine"]}
+    data = {"image": sample["image"], "label": sample["label"]}
+    pipeline = Compose([
+        ConvertToMultiChannelBasedOnBratsClasses(keys=["label"]),
+        CropForeground(keys=("image", "label"), source_key="image", k_divisible=roi_size),
+        RandSpatialCrop(keys=["image", "label"], roi_size=roi_size, random_size=False),
+        RandFlip(keys=["image", "label"], spatial_axis=[0], prob=0.5),
+        RandFlip(keys=["image", "label"], spatial_axis=[1], prob=0.5),
+        RandFlip(keys=["image", "label"], spatial_axis=[2], prob=0.5),
+        NormalizeIntensity(keys=["image"], nonzero=True, channel_wise=True),
+        RandShiftIntensity(keys=["image"], offsets=0.10, prob=1.0),
+    ])
+    result = pipeline(data, meta)
+    return result["image"], result["label"]
+
+
+def _val_transformation(sample):
+    meta = {"affine": sample["affine"]}
+    data = {"image": sample["image"], "label": sample["label"]}
+    pipeline = Compose([
+        ConvertToMultiChannelBasedOnBratsClasses(keys=["label"]),
+        NormalizeIntensity(keys=["image"], nonzero=True, channel_wise=True),
+    ])
+    result = pipeline(data, meta)
+    return result["image"], result["label"]
+
+
+def build_model(config):
+    """
+    config keys:
+        encoder_name     (str,   default "swin_tiny_v2")
+        input_shape      (tuple, default (96, 96, 96, 4))
+        num_classes      (int,   default 3)
+        learning_rate    (float, default 1e-4)
+        weight_decay     (float, default 1e-5)
+        mixed_precision  (bool,  default True)
+    """
+    if config.get("mixed_precision", True):
+        keras.mixed_precision.set_global_policy("mixed_float16")
+
+    encoder_name = config.get("encoder_name", "swin_tiny_v2")
+    input_shape = config.get("input_shape", (96, 96, 96, 4))
+    num_classes = config.get("num_classes", 3)
+    learning_rate = config.get("learning_rate", 1e-4)
+    weight_decay = config.get("weight_decay", 1e-5)
+
+    model = SwinUNETR(
+        encoder_name=encoder_name,
+        input_shape=input_shape,
+        num_classes=num_classes,
+        classifier_activation=None,
+    )
+    model.compile(
+        optimizer=keras.optimizers.AdamW(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        ),
+        loss=BinaryDiceCELoss(from_logits=True, num_classes=num_classes),
+        metrics=[
+            BinaryDiceMetric(from_logits=True, ignore_empty=True, num_classes=num_classes, name="dice"),
+            BinaryDiceMetric(from_logits=True, ignore_empty=True, target_class_ids=[0], num_classes=num_classes, name="dice_tc"),
+            BinaryDiceMetric(from_logits=True, ignore_empty=True, target_class_ids=[1], num_classes=num_classes, name="dice_wt"),
+            BinaryDiceMetric(from_logits=True, ignore_empty=True, target_class_ids=[2], num_classes=num_classes, name="dice_et"),
+        ],
+    )
+    return model
+
+
+def build_dataloader(config, split):
+    """
+    config keys:
+        tfrecord_pattern  (str)  glob pattern; alternatively:
+        train_files       (list) explicit file list for train split
+        val_files         (list) explicit file list for val split
+        batch_size        (int,  default 1)
+        shuffle_buffer    (int,  default 100)
+    split: "train" or "val"
+    """
+    batch_size = config.get("batch_size", 1)
+
+    if split == "train":
+        files = config.get("train_files") or _resolve_files(config, "train")
+        dataset = tf.data.TFRecordDataset(files)
+        dataset = dataset.shuffle(config.get("shuffle_buffer", 100))
+        dataset = dataset.map(_parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(_rearrange_shape, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(_train_transformation, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.batch(batch_size, drop_remainder=True)
+    else:
+        files = config.get("val_files") or _resolve_files(config, "val")
+        dataset = tf.data.TFRecordDataset(files)
+        dataset = dataset.map(_parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(_rearrange_shape, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(_val_transformation, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.batch(1)
+
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+
+def _resolve_files(config, split):
+    pattern = config.get("tfrecord_pattern")
+    if pattern is None:
+        raise ValueError("Provide 'train_files'/'val_files' or 'tfrecord_pattern' in config.")
+    all_files = sorted(
+        tf.io.gfile.glob(pattern),
+        key=lambda x: int(x.split("_")[-1].split(".")[0]),
+    )
+    if split == "train":
+        return all_files[:-1]
+    return all_files[-1:]
+
+
+def train_step(model, batch, optimizer, config):
+    """
+    Performs a single gradient-update step.
+
+    Parameters
+    ----------
+    model     : compiled Keras model returned by build_model()
+    batch     : (images, labels) tuple from the dataloader
+    optimizer : a keras Optimizer (can be shared across FL rounds)
+    config    : dict (unused here but kept for interface uniformity)
+
+    Returns
+    -------
+    dict with loss and metric values for this batch
+    """
+    images, labels = batch
+    num_classes = config.get("num_classes", 3)
+
+    loss_fn = BinaryDiceCELoss(from_logits=True, num_classes=num_classes)
+
+    with tf.GradientTape() as tape:
+        predictions = model(images, training=True)
+        loss = loss_fn(labels, predictions)
+
+    grads = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+    metrics = {}
+    metrics["loss"] = float(ops.convert_to_numpy(loss))
+    for metric in model.metrics:
+        metric.update_state(labels, predictions)
+        metrics[metric.name] = float(ops.convert_to_numpy(metric.result()))
+
+    return metrics

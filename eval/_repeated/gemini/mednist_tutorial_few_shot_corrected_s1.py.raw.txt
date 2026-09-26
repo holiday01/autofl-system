@@ -1,0 +1,264 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: monai_ixi_classification_script.py (example source)
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+import monai
+from monai.data import ImageDataset as MonaiImageDataset
+from monai.transforms import EnsureChannelFirst, Compose, RandRotate90, Resize, ScaleIntensity
+from monai.networks.nets import DenseNet121
+
+
+# --- Custom Dataset for FL client with Synthetic Fallback ---
+
+class IXIImageDataClientDataset(Dataset):
+    """
+    A custom dataset that can either load image files using MONAI's ImageDataset
+    or generate synthetic data if files are not available.
+    """
+    def __init__(self, image_files, labels, transform=None,
+                 target_image_dims=(96, 96, 96), num_classes=2):
+        self.transform = transform
+        self.image_files = image_files
+        self.labels = labels
+        self.target_image_dims = target_image_dims
+        self.num_classes = num_classes
+
+        # Check for actual data presence
+        self.has_real_data = bool(image_files and all(os.path.exists(f) for f in image_files))
+
+        if self.has_real_data:
+            self.monai_dataset = MonaiImageDataset(
+                image_files=image_files,
+                labels=labels,
+                transform=transform
+            )
+            self._len = len(self.monai_dataset)
+        else:
+            print(
+                "WARNING: Data files not found or list is empty. "
+                "Using synthetic data. Ensure 'target_image_dims' in config "
+                "matches model input if default transforms are bypassed."
+            )
+            # If no real data, determine length from provided labels or fallback
+            self._len = len(labels) if labels else 20
+            # If labels are also missing, generate synthetic labels
+            if not labels and self._len > 0:
+                 self.labels = [i % self.num_classes for i in range(self._len)]
+            elif labels and not self._len: # labels provided but empty list
+                 self._len = 20
+                 self.labels = [i % self.num_classes for i in range(self._len)]
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        if self.has_real_data:
+            return self.monai_dataset[idx]
+        else:
+            # Generate synthetic data as a 3D numpy array (H, W, D), then apply transforms.
+            # The synthetic data is generated to match the target dimensions directly,
+            # assuming Resize transform (if present) would simply confirm this size.
+            synthetic_image_np = np.random.rand(*self.target_image_dims).astype(np.float32) * 255
+
+            # Apply transforms
+            if self.transform:
+                image_tensor = self.transform(synthetic_image_np)
+            else:
+                # If no transform is provided for synthetic data, apply a minimal set
+                # to get it into the expected (C, H, W, D) tensor format.
+                # This ensures consistency with the typical MONAI workflow.
+                image_tensor = Compose([
+                    ScaleIntensity(), # Normalize random data
+                    EnsureChannelFirst(), # Add channel dimension
+                    Resize(self.target_image_dims) # Ensure final dimensions
+                ])(synthetic_image_np)
+
+            label_tensor = torch.tensor(self.labels[idx], dtype=torch.long)
+            return image_tensor, label_tensor
+
+
+# --- Helper to build MONAI transforms ---
+
+def _build_transforms(config: dict, is_train: bool) -> Compose:
+    """Helper to build MONAI transforms based on config."""
+    resize_dim = config.get("resize_dim", (96, 96, 96))
+    do_rand_rotate = config.get("do_rand_rotate", is_train) # Only apply RandRotate90 for train by default
+
+    transforms_list = [
+        ScaleIntensity(),
+        EnsureChannelFirst(),
+        Resize(resize_dim),
+    ]
+    if do_rand_rotate:
+        transforms_list.append(RandRotate90())
+
+    return Compose(transforms_list)
+
+
+# --- FL Interface Functions ---
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Builds and returns the MONAI DenseNet121 model.
+    Model parameters are taken from 'model_kwargs' in the config.
+    """
+    kwargs = config.get("model_kwargs", {})
+    # Default parameters based on original script
+    spatial_dims = kwargs.get("spatial_dims", 3)
+    in_channels = kwargs.get("in_channels", 1)
+    out_channels = kwargs.get("out_channels", 2) # Binary classification (man/woman)
+    return DenseNet121(
+        spatial_dims=spatial_dims,
+        in_channels=in_channels,
+        out_channels=out_channels
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Builds and returns a PyTorch DataLoader for the specified split ('train' or 'val').
+    Data loading parameters are taken from 'config'.
+    Includes synthetic data fallback if specified data path is invalid.
+    """
+    local_config = config.get("local", {})
+    batch_size = local_config.get("batch_size", config.get("batch_size", 2))
+    num_workers = local_config.get("num_workers", config.get("num_workers", 2))
+    pin_memory = local_config.get("pin_memory", True)
+    seed = config.get("seed", 42) # For consistent data splits if shuffling
+
+    # Data path and file list from the original script
+    # This path is relative to the client's execution context
+    data_path = config.get("data_path", "./workspace/data/medical/ixi/IXI-T1")
+    base_image_names = [
+        "IXI314-IOP-0889-T1.nii.gz", "IXI249-Guys-1072-T1.nii.gz", "IXI609-HH-2600-T1.nii.gz",
+        "IXI173-HH-1590-T1.nii.gz", "IXI020-Guys-0700-T1.nii.gz", "IXI342-Guys-0909-T1.nii.gz",
+        "IXI134-Guys-0780-T1.nii.gz", "IXI577-HH-2661-T1.nii.gz", "IXI066-Guys-0731-T1.nii.gz",
+        "IXI130-HH-1528-T1.nii.gz", "IXI607-Guys-1097-T1.nii.gz", "IXI175-HH-1570-T1.nii.gz",
+        "IXI385-HH-2078-T1.nii.gz", "IXI344-Guys-0905-T1.nii.gz", "IXI409-Guys-0960-T1.nii.gz",
+        "IXI584-Guys-1129-T1.nii.gz", "IXI253-HH-1694-T1.nii.gz", "IXI092-HH-1436-T1.nii.gz",
+        "IXI574-IOP-1156-T1.nii.gz", "IXI585-Guys-1130-T1.nii.gz",
+    ]
+    full_image_files = [os.path.join(data_path, f) for f in base_image_names]
+    full_labels = np.array([0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0], dtype=np.int64)
+
+    num_total_samples = len(full_labels)
+
+    # Determine image files and labels for the specific split
+    train_image_files = []
+    train_labels = []
+    val_image_files = []
+    val_labels = []
+
+    # Replicate original script's split (first 10 for train, last 10 for val if enough data)
+    # Otherwise, use a ratio-based split, which is more robust for varying total sample counts.
+    if num_total_samples >= 20:
+        train_image_files = full_image_files[:10]
+        train_labels = full_labels[:10].tolist()
+        val_image_files = full_image_files[-10:]
+        val_labels = full_labels[-10:].tolist()
+    else:
+        # Fallback for fewer than 20 samples or when synthetic data is implied
+        val_ratio = config.get("val_ratio", 0.2)
+        n_val = max(1, int(num_total_samples * val_ratio))
+        n_train = num_total_samples - n_val
+
+        # Shuffle and split for robustness (even if synthetic, for consistency)
+        indices = list(range(num_total_samples))
+        generator = torch.Generator().manual_seed(seed)
+        shuffled_indices = torch.randperm(num_total_samples, generator=generator).tolist()
+
+        train_indices = shuffled_indices[:n_train]
+        val_indices = shuffled_indices[n_train:]
+
+        train_image_files = [full_image_files[i] for i in train_indices]
+        train_labels = full_labels[train_indices].tolist()
+        val_image_files = [full_image_files[i] for i in val_indices]
+        val_labels = full_labels[val_indices].tolist()
+
+    if split == "train":
+        ds_image_files = train_image_files
+        ds_labels = train_labels
+        transforms = _build_transforms(config, is_train=True)
+    elif split == "val":
+        ds_image_files = val_image_files
+        ds_labels = val_labels
+        transforms = _build_transforms(config, is_train=False)
+    else:
+        raise ValueError(f"Invalid split: {split}. Expected 'train' or 'val'.")
+
+    # Use dataset_kwargs from config to pass to the custom dataset (e.g., target_image_dims, num_classes)
+    dataset_kwargs = config.get("dataset_kwargs", {})
+    # Ensure target_image_dims and num_classes are passed to IXIImageDataClientDataset constructor,
+    # either from config or default values.
+    # Defaults taken from model_kwargs (out_channels for num_classes) and transforms (resize_dim)
+    model_kwargs = config.get("model_kwargs", {})
+    resize_dim = config.get("resize_dim", (96, 96, 96))
+    num_classes = model_kwargs.get("out_channels", 2)
+
+    ds = IXIImageDataClientDataset(
+        image_files=ds_image_files,
+        labels=ds_labels,
+        transform=transforms,
+        target_image_dims=dataset_kwargs.get("target_image_dims", resize_dim),
+        num_classes=dataset_kwargs.get("num_classes", num_classes),
+    )
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,  # Not directly used as per FL contract, but part of signature
+    config: dict,
+) -> torch.Tensor:
+    """
+    Performs one forward pass and computes the loss.
+    Returns the raw loss tensor with grad_fn attached.
+    """
+    device = next(model.parameters()).device # Get model's current device
+
+    # Move batch data to device
+    if isinstance(batch, (list, tuple)):
+        inputs, targets = batch[0].to(device), batch[1].to(device)
+    elif isinstance(batch, dict):
+        # Handle common dict keys for inputs and targets
+        inputs = batch.get("input", batch.get("x", batch.get("image"))).to(device)
+        targets = batch.get("label", batch.get("y", batch.get("target"))).to(device)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+
+    # Instantiate loss function (CrossEntropyLoss as in original script)
+    # Loss function can be configured, but standard practice often keeps it simple for FL client.
+    criterion = torch.nn.CrossEntropyLoss()
+    loss = criterion(outputs, targets)
+    return loss
+```

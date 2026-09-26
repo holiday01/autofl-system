@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+eval/_expansion/Datasets/
+MNIST/
+FashionMNIST/
+cifar-10-batches-py/

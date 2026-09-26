@@ -1,0 +1,211 @@
+"""
+Auto-generated FL client module.
+Original script: Image classification from scratch (Keras)
+
+Exposes:
+  build_model(config)               -> keras.Model
+  build_dataloader(config, split)   -> tf.data.Dataset
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .numpy()).
+  - Do NOT call loss.backward() or equivalent (e.g., tape.gradient).
+  - Do NOT call optimizer.step() or optimizer.zero_grad() or apply_gradients().
+  - Do NOT call .item() or .numpy() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np
+import keras
+from keras import layers
+from tensorflow import data as tf_data
+
+# Constants and helpers for default values and data loading.
+# These would typically be overridden by the 'config' dictionary in an FL setup.
+_DEFAULT_IMAGE_SIZE = (180, 180)
+_DEFAULT_BATCH_SIZE = 32  # Adjusted from 128 to a more common FL batch size
+_DEFAULT_NUM_CLASSES = 2  # Cats vs Dogs is binary classification
+_DEFAULT_SEED = 1337
+_DEFAULT_VALIDATION_SPLIT = 0.2
+_DEFAULT_DATA_PATH = "PetImages" # Assumes "PetImages" directory exists and is pre-cleaned
+
+# -----------------------------------------------------------------------------
+# Data Augmentation Layers (used within build_dataloader)
+# These Keras layers should be instantiated once for efficiency within the map function context.
+# Defined globally for convenience but instantiated within build_dataloader.
+# -----------------------------------------------------------------------------
+
+def _create_data_augmentation_layers():
+    """Returns a list of Keras data augmentation layers."""
+    return [
+        layers.RandomFlip("horizontal"),
+        layers.RandomRotation(0.1),
+    ]
+
+# -----------------------------------------------------------------------------
+# Model Definition (make_model function)
+# -----------------------------------------------------------------------------
+
+def _make_model(input_shape, num_classes):
+    """
+    Constructs and returns the Keras image classification model (Xception-like).
+    """
+    inputs = keras.Input(shape=input_shape)
+
+    # Entry block
+    x = layers.Rescaling(1.0 / 255)(inputs)
+    x = layers.Conv2D(128, 3, strides=2, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    previous_block_activation = x  # Set aside residual
+
+    for size in [256, 512, 728]:
+        x = layers.Activation("relu")(x)
+        x = layers.SeparableConv2D(size, 3, padding="same")(x)
+        x = layers.BatchNormalization()(x)
+
+        x = layers.Activation("relu")(x)
+        x = layers.SeparableConv2D(size, 3, padding="same")(x)
+        x = layers.BatchNormalization()(x)
+
+        x = layers.MaxPooling2D(3, strides=2, padding="same")(x)
+
+        # Project residual
+        residual = layers.Conv2D(size, 1, strides=2, padding="same")(
+            previous_block_activation
+        )
+        x = layers.add([x, residual])  # Add back residual
+        previous_block_activation = x  # Set aside next residual
+
+    x = layers.SeparableConv2D(1024, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    if num_classes == 2:
+        units = 1  # For binary classification with BinaryCrossentropy(from_logits=True)
+    else:
+        units = num_classes  # For multi-class classification
+
+    x = layers.Dropout(0.25)(x)
+    # We specify activation=None so as to return logits for stable loss computation
+    outputs = layers.Dense(units, activation=None)(x)
+    return keras.Model(inputs, outputs)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    """
+    Builds and returns a Keras Model instance.
+
+    Args:
+        config: A dictionary containing configuration parameters.
+                Expected keys: "model_kwargs" -> {"input_shape", "num_classes"}
+
+    Returns:
+        A compiled Keras Model.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    input_shape = model_kwargs.get("input_shape", _DEFAULT_IMAGE_SIZE + (3,))
+    num_classes = model_kwargs.get("num_classes", _DEFAULT_NUM_CLASSES)
+
+    return _make_model(input_shape=input_shape, num_classes=num_classes)
+
+
+def build_dataloader(config: dict, split: str = "train") -> tf_data.Dataset:
+    """
+    Builds and returns a TensorFlow Dataset (`tf.data.Dataset`).
+
+    Args:
+        config: A dictionary containing configuration parameters.
+                Expected keys: "local" (for local client overrides),
+                               "data_path", "image_size", "batch_size",
+                               "seed", "validation_split".
+        split: A string, either "train" or "val", indicating which dataset split to return.
+
+    Returns:
+        A tf.data.Dataset object configured for training or validation.
+    """
+    local = config.get("local", {})
+
+    data_path = config.get("data_path", _DEFAULT_DATA_PATH)
+    image_size = config.get("image_size", _DEFAULT_IMAGE_SIZE)
+    batch_size = local.get("batch_size", config.get("batch_size", _DEFAULT_BATCH_SIZE))
+    seed = config.get("seed", _DEFAULT_SEED)
+    validation_split = config.get("validation_split", _DEFAULT_VALIDATION_SPLIT)
+
+    # The original script includes a step to filter corrupted images.
+    # For FL, it's assumed the data at `data_path` is already prepared and clean.
+    # If not, `image_dataset_from_directory` might raise errors.
+
+    subset_type = "training" if split == "train" else "validation"
+
+    ds = keras.utils.image_dataset_from_directory(
+        data_path,
+        validation_split=validation_split,
+        subset=subset_type,
+        seed=seed,
+        image_size=image_size,
+        batch_size=batch_size,
+        # Ensure labels are integers
+        label_mode="int",
+    )
+
+    # Apply data augmentation only for the training split
+    if split == "train":
+        augmentation_layers = _create_data_augmentation_layers()
+
+        def _augment_fn(images, labels):
+            for layer in augmentation_layers:
+                images = layer(images)
+            return images, labels
+
+        ds = ds.map(
+            _augment_fn,
+            num_parallel_calls=tf_data.AUTOTUNE,
+        )
+
+    # Prefetching samples for performance
+    ds = ds.prefetch(tf_data.AUTOTUNE)
+    return ds
+
+
+def train_step(
+    model: keras.Model,
+    batch: tuple | list,
+    optimizer: keras.optimizers.Optimizer,  # Optimizer is passed but not used internally per contract
+    config: dict,
+) -> keras.Tensor:
+    """
+    Performs ONE forward pass and returns the raw loss tensor for a Keras model.
+
+    This function adheres to the FL contract: it does not perform backward pass,
+    optimizer steps, or detach/convert the loss tensor.
+
+    Args:
+        model: The Keras Model instance.
+        batch: A tuple (inputs, targets) from the tf.data.Dataset.
+        optimizer: The Keras optimizer instance (not used in this function per contract).
+        config: A dictionary containing configuration parameters.
+
+    Returns:
+        A tf.Tensor representing the raw loss value for the batch, with gradient
+        tracking enabled if applicable (i.e., when called within a tf.GradientTape).
+    """
+    # Unpack batch: (images, labels)
+    inputs, targets = batch[0], batch[1]
+
+    # Forward pass: `training=True` ensures dropout and batch norm layers
+    # behave in training mode.
+    outputs = model(inputs, training=True)
+
+    # Compute loss using the specified Keras loss function.
+    # The original script used BinaryCrossentropy with from_logits=True.
+    loss_fn = keras.losses.BinaryCrossentropy(from_logits=True)
+    # Keras losses typically take (y_true, y_pred)
+    loss = loss_fn(targets, outputs)
+
+    return loss

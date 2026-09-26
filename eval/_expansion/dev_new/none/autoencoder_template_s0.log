@@ -1,0 +1,3 @@
+  Preflight [eval-client]: FAIL at [forward_pass]  (2.0s)
+    Error: NameError: name 'self' is not defined
+EVALJSON {"syntax_valid": true, "interface_complete": true, "build_model_present": true, "build_dataloader_present": true, "train_step_present": true, "optimizer_detected": true, "preflight_pass": false, "e2e_runnable": false, "error_stage": "preflight/forward_pass", "error_message": "NameError: name 'self' is not defined", "elapsed_sec": 1.99, "data_path": ".", "data_path_exists": true, "strict_data": false, "spec_version": "n/a", "dataset_class": "MNIST", "dataset_len": 60000, "component_coverage": 1.0}

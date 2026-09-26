@@ -1,0 +1,270 @@
+```python
+# Copyright (c) MONAI Consortium
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import sys
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset, random_split
+
+import monai
+from monai.data import ImageDataset
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirst,
+    LoadImage,
+    RandRotate90,
+    Resize,
+    ScaleIntensity,
+)
+
+
+# ---------------------------------------------------------------------------
+# Internal dataset helpers  (MONAI transforms are wrapped here, per the rules)
+# ---------------------------------------------------------------------------
+
+class _RawIXIDataset(Dataset):
+    """Loads NIfTI files with LoadImage and returns (raw_image, label).
+
+    Heavy spatial / augmentation transforms are intentionally deferred so
+    that random_split can hand out train / val subsets that each receive
+    their own Compose pipeline via _TransformDataset.
+    """
+
+    def __init__(self, image_files, labels):
+        self.image_files = image_files
+        self.labels = labels
+        self._loader = LoadImage(image_only=True)
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img = self._loader(self.image_files[idx])
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        return img, label
+
+
+class _TransformDataset(Dataset):
+    """Wraps a Subset and lazily applies a MONAI Compose transform per sample."""
+
+    def __init__(self, subset, transform):
+        self.subset = subset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        img, label = self.subset[idx]
+        img = self.transform(img)
+        return img, label
+
+
+class _SyntheticDataset(Dataset):
+    """Fully synthetic 3-D MRI stand-in — only used when allowed by config."""
+
+    def __init__(self, num_samples: int = 20, spatial_size: tuple = (96, 96, 96)):
+        self.num_samples = num_samples
+        self.spatial_size = spatial_size
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        image = torch.randn(1, *self.spatial_size)
+        label = torch.randint(0, 2, (), dtype=torch.long)
+        return image, label
+
+
+# ---------------------------------------------------------------------------
+# FL API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate and return the 3-D DenseNet121 classification model.
+
+    Recognised model_kwargs keys (all optional):
+        spatial_dims  int   default 3
+        in_channels   int   default 1
+        out_channels  int   default 2
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    model = monai.networks.nets.DenseNet121(
+        spatial_dims=model_kwargs.get("spatial_dims", 3),
+        in_channels=model_kwargs.get("in_channels", 1),
+        out_channels=model_kwargs.get("out_channels", 2),
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split ('train' or 'val').
+
+    Config keys consumed:
+        local.batch_size        int    default 16
+        data_path               str    default './workspace/data/medical/ixi/IXI-T1'
+        train_val_split         float  default 0.8  (fraction assigned to train)
+        allow_synthetic_data    bool   default False
+    """
+    local_cfg = config.get("local", {})
+    batch_size = local_cfg.get("batch_size", 16)
+    data_path = config.get(
+        "data_path",
+        os.sep.join([".", "workspace", "data", "medical", "ixi", "IXI-T1"]),
+    )
+    train_frac = float(config.get("train_val_split", 0.8))
+
+    # Hardcoded IXI-T1 file list and gender labels preserved from original script
+    image_names = [
+        "IXI314-IOP-0889-T1.nii.gz",
+        "IXI249-Guys-1072-T1.nii.gz",
+        "IXI609-HH-2600-T1.nii.gz",
+        "IXI173-HH-1590-T1.nii.gz",
+        "IXI020-Guys-0700-T1.nii.gz",
+        "IXI342-Guys-0909-T1.nii.gz",
+        "IXI134-Guys-0780-T1.nii.gz",
+        "IXI577-HH-2661-T1.nii.gz",
+        "IXI066-Guys-0731-T1.nii.gz",
+        "IXI130-HH-1528-T1.nii.gz",
+        "IXI607-Guys-1097-T1.nii.gz",
+        "IXI175-HH-1570-T1.nii.gz",
+        "IXI385-HH-2078-T1.nii.gz",
+        "IXI344-Guys-0905-T1.nii.gz",
+        "IXI409-Guys-0960-T1.nii.gz",
+        "IXI584-Guys-1129-T1.nii.gz",
+        "IXI253-HH-1694-T1.nii.gz",
+        "IXI092-HH-1436-T1.nii.gz",
+        "IXI574-IOP-1156-T1.nii.gz",
+        "IXI585-Guys-1130-T1.nii.gz",
+    ]
+    # 2 binary labels for gender classification: 0 = man, 1 = woman
+    all_labels = np.array(
+        [0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+        dtype=np.int64,
+    )
+    image_paths = [os.path.join(data_path, f) for f in image_names]
+
+    # ------------------------------------------------------------------
+    # Real-data availability check
+    # ------------------------------------------------------------------
+    real_data_available = os.path.isdir(data_path) and all(
+        os.path.isfile(p) for p in image_paths
+    )
+
+    if not real_data_available:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"IXI-T1 dataset not found at '{data_path}'. "
+                "Ensure the directory exists and contains all 20 expected NIfTI files, "
+                "or set config['allow_synthetic_data'] = True to use synthetic tensors "
+                "for smoke-testing only."
+            )
+        # Synthetic fallback — only reached when explicitly allowed
+        total = 20
+        n_train = max(1, int(total * train_frac))
+        n_val = total - n_train
+        full_synth = _SyntheticDataset(num_samples=total)
+        train_subset, val_subset = random_split(
+            full_synth,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(42),
+        )
+        chosen = train_subset if split == "train" else val_subset
+        return DataLoader(
+            chosen,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+            num_workers=0,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+    # ------------------------------------------------------------------
+    # Real data path: load once, split, then wrap with per-split transforms
+    # ------------------------------------------------------------------
+    train_transforms = Compose(
+        [ScaleIntensity(), EnsureChannelFirst(), Resize((96, 96, 96)), RandRotate90()]
+    )
+    val_transforms = Compose(
+        [ScaleIntensity(), EnsureChannelFirst(), Resize((96, 96, 96))]
+    )
+
+    total = len(image_paths)
+    n_train = max(1, int(total * train_frac))
+    n_val = total - n_train
+
+    raw_ds = _RawIXIDataset(image_paths, all_labels)
+    train_raw, val_raw = random_split(
+        raw_ds,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    if split == "train":
+        dataset = _TransformDataset(train_raw, train_transforms)
+        shuffle = True
+    else:
+        dataset = _TransformDataset(val_raw, val_transforms)
+        shuffle = False
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Run one forward pass and return the scalar loss WITH grad attached.
+
+    Contract:
+      - Calls optimizer.zero_grad() so accumulated gradients are cleared
+        before the pass the FL runtime will differentiate.
+      - Does NOT call loss.backward() or optimizer.step(); the FL runtime
+        is solely responsible for those.
+    """
+    device = next(model.parameters()).device
+
+    inputs = batch[0].to(device)
+    labels = batch[1].to(device)
+
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    model.train()
+    optimizer.zero_grad()
+    outputs = model(inputs)
+    loss = loss_fn(outputs, labels)
+    # NOTE: backward() and optimizer.step() are intentionally omitted;
+    #       the FL runtime invokes them after aggregation.
+    return loss
+```
+
+---
+
+Here is a summary of every design decision made:
+
+| Concern | Decision |
+|---|---|
+| **Model** | `monai.networks.nets.DenseNet121` preserved verbatim; constructor args forwarded from `config["model_kwargs"]` with the original defaults (`spatial_dims=3, in_channels=1, out_channels=2`). |
+| **MONAI transforms** | Wrapped inside `_TransformDataset`, which decorates a `Subset` returned by `random_split`. This is the required pattern when MONAI transforms must differ between splits but `random_split` needs a single base dataset. |
+| **`random_split`** | A single `_RawIXIDataset` (LoadImage only) is split 80/20 with a fixed seed; each half is then wrapped in `_TransformDataset` with its own `Compose` pipeline (train adds `RandRotate90`, val does not). |
+| **Synthetic fallback** | `_SyntheticDataset` is only constructed when `config.get("allow_synthetic_data", False)` is `True`; otherwise a `FileNotFoundError` with a clear message is raised. |
+| **`train_step`** | Calls `optimizer.zero_grad()` then a single forward pass; returns the loss tensor with grad intact. `loss.backward()` and `optimizer.step()` are explicitly absent. |

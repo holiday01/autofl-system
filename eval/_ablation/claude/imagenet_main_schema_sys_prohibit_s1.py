@@ -1,0 +1,282 @@
+import argparse
+import os
+import random
+import shutil
+import time
+import warnings
+from enum import Enum
+
+import torch
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn as nn
+import torch.nn.parallel
+import torch.optim
+import torch.utils.data
+import torch.utils.data.distributed
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import Subset, DataLoader, random_split, TensorDataset
+
+
+# ── Preserved helper classes from the original script ────────────────────────
+
+class Summary(Enum):
+    NONE = 0
+    AVERAGE = 1
+    SUM = 2
+    COUNT = 3
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, use_accel, fmt=':f', summary_type=Summary.AVERAGE):
+        self.name = name
+        self.use_accel = use_accel
+        self.fmt = fmt
+        self.summary_type = summary_type
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def all_reduce(self):
+        if self.use_accel:
+            device = torch.accelerator.current_accelerator()
+        else:
+            device = torch.device("cpu")
+        total = torch.tensor([self.sum, self.count], dtype=torch.float32, device=device)
+        dist.all_reduce(total, dist.ReduceOp.SUM, async_op=False)
+        self.sum, self.count = total.tolist()
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
+
+    def summary(self):
+        fmtstr = ''
+        if self.summary_type is Summary.NONE:
+            fmtstr = ''
+        elif self.summary_type is Summary.AVERAGE:
+            fmtstr = '{name} {avg:.3f}'
+        elif self.summary_type is Summary.SUM:
+            fmtstr = '{name} {sum:.3f}'
+        elif self.summary_type is Summary.COUNT:
+            fmtstr = '{name} {count:.3f}'
+        else:
+            raise ValueError('invalid summary type %r' % self.summary_type)
+        return fmtstr.format(**self.__dict__)
+
+
+class ProgressMeter(object):
+    def __init__(self, num_batches, meters, prefix=""):
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+        self.meters = meters
+        self.prefix = prefix
+
+    def display(self, batch):
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries += [str(meter) for meter in self.meters]
+        print('\t'.join(entries))
+
+    def display_summary(self):
+        entries = [" *"]
+        entries += [meter.summary() for meter in self.meters]
+        print(' '.join(entries))
+
+    def _get_batch_fmtstr(self, num_batches):
+        num_digits = len(str(num_batches // 1))
+        fmt = '{:' + str(num_digits) + 'd}'
+        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
+# ── FL API ────────────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate and return a torchvision model.
+
+    config["model_kwargs"] may contain:
+      - "arch"    : torchvision model family name (default: "resnet18")
+      - "weights" : e.g. "IMAGENET1K_V1" for pretrained weights, or None
+      - any other keyword accepted by the chosen model constructor
+
+    All keys except "arch" are forwarded verbatim to the constructor.
+    """
+    kwargs = dict(config.get("model_kwargs", {}))
+    arch = kwargs.pop("arch", "resnet18")
+
+    _available = sorted(
+        name for name in models.__dict__
+        if name.islower() and not name.startswith("__") and callable(models.__dict__[name])
+    )
+    if arch not in models.__dict__ or not callable(models.__dict__[arch]):
+        raise ValueError(
+            f"Unknown torchvision architecture '{arch}'. "
+            f"Available architectures: {_available}"
+        )
+
+    model = models.__dict__[arch](**kwargs)
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split ('train' or 'val').
+
+    Config keys
+    -----------
+    config["data_path"]              Root directory that contains a 'train/'
+                                     sub-directory laid out as ImageFolder
+                                     expects  (default: ".")
+    config["local"]["batch_size"]    Mini-batch size  (default: 16)
+    config["num_workers"]            DataLoader worker processes  (default: 4)
+    config["val_fraction"]           Fraction of data reserved for val  (default: 0.1)
+    config["allow_synthetic_data"]   Must be True to use the synthetic fallback;
+                                     if False and real data is absent a
+                                     FileNotFoundError is raised  (default: False)
+    config["synthetic_samples"]      Number of synthetic samples  (default: 128)
+    config["num_classes"]            Number of output classes for synthetic
+                                     labels  (default: 1000)
+
+    Both splits are derived from the same 'train/' directory via random_split
+    (seed 42) so that the split is reproducible and non-overlapping across calls.
+    The split-appropriate image augmentation pipeline is applied in each case:
+    random-crop + flip for training; resize + centre-crop for validation.
+    """
+    batch_size   = config.get("local", {}).get("batch_size", 16)
+    data_path    = config.get("data_path", ".")
+    num_workers  = config.get("num_workers", 4)
+    val_fraction = config.get("val_fraction", 0.1)
+
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    transform = train_transform if split == "train" else val_transform
+    train_dir  = os.path.join(data_path, "train")
+
+    if os.path.isdir(train_dir):
+        # ── real data path ──────────────────────────────────────────────────
+        # Load with the split-appropriate transform so augmentation is correct.
+        # random_split uses a fixed seed → train and val indices are consistent
+        # across the two build_dataloader("train") / build_dataloader("val") calls.
+        full_dataset = datasets.ImageFolder(train_dir, transform=transform)
+
+        n_total = len(full_dataset)
+        n_val   = max(1, int(n_total * val_fraction))
+        n_train = n_total - n_val
+
+        train_subset, val_subset = random_split(
+            full_dataset,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(42),
+        )
+
+        dataset     = train_subset if split == "train" else val_subset
+        shuffle     = split == "train"
+        pin_memory  = True
+        workers     = num_workers
+
+    else:
+        # ── synthetic fallback (strictly gated) ─────────────────────────────
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"ImageNet 'train' directory not found at '{train_dir}'. "
+                "Supply real data via config['data_path'], or set "
+                "config['allow_synthetic_data'] = True to use synthetic tensors."
+            )
+
+        n_total     = config.get("synthetic_samples", 128)
+        num_classes = config.get("num_classes", 1000)
+
+        images      = torch.randn(n_total, 3, 224, 224)
+        labels      = torch.randint(0, num_classes, (n_total,))
+        full_dataset = TensorDataset(images, labels)
+
+        n_val   = max(1, int(n_total * val_fraction))
+        n_train = n_total - n_val
+
+        train_subset, val_subset = random_split(
+            full_dataset,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(42),
+        )
+
+        dataset     = train_subset if split == "train" else val_subset
+        shuffle     = split == "train"
+        pin_memory  = False   # tensors are already in host memory
+        workers     = 0       # no file I/O; extra workers only add overhead
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=workers,
+        pin_memory=pin_memory,
+    )
+
+
+def train_step(model, batch, optimizer, config: dict) -> torch.Tensor:
+    """Run ONE forward pass and return the live loss tensor.
+
+    The FL runtime owns the backward pass and the optimiser step; this
+    function intentionally does neither.  The returned tensor retains its
+    grad_fn so that the runtime can call loss.backward() on it.
+    """
+    device = next(model.parameters()).device
+
+    images, target = batch
+    images = images.to(device, non_blocking=True)
+    target = target.to(device, non_blocking=True)
+
+    model.train()
+    output    = model(images)
+    criterion = nn.CrossEntropyLoss()
+    loss      = criterion(output, target)
+
+    # Return the live loss tensor.
+    # Do NOT call loss.backward(), loss.detach(), loss.item(), or
+    # optimizer.step() — the FL runtime handles all of that.
+    return loss

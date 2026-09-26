@@ -1,0 +1,148 @@
+"""
+Auto-generated FL client module.
+Original script: [provide path/name of the original script, e.g., pytorch/mnist/main.py]
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+
+# --- Model Definition ---
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        output = F.log_softmax(x, dim=1)
+        return output
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Builds and returns the PyTorch model.
+    Model kwargs can be passed via config['model_kwargs'].
+    """
+    # The Net class in this example doesn't take __init__ arguments,
+    # so model_kwargs from config are not directly used here for Net.
+    # If the model had arguments, they would be passed like:
+    # kwargs = config.get("model_kwargs", {})
+    # return Net(**kwargs)
+    return Net()
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Builds and returns a DataLoader for the specified split (train or test).
+    DataLoader configuration (batch_size, num_workers, etc.) can be passed
+    via config dict, potentially overridden by config['local'] for client-specific settings.
+    Data path comes from config['data_path'].
+    """
+    local = config.get("local", {})
+    
+    # Determine batch size based on split, with fallback to general config and default
+    if split == "train":
+        batch_size = local.get("batch_size", config.get("batch_size", 64))
+    elif split == "test":
+        batch_size = local.get("val_batch_size", config.get("val_batch_size", 1000))
+    else:
+        raise ValueError(f"Unsupported split: {split}. Expected 'train' or 'test'.")
+
+    num_workers = local.get("num_workers", config.get("num_workers", 1))
+    pin_memory = local.get("pin_memory", True)
+    data_path = config.get("data_path", "./data") # Default data path
+
+    # Ensure data_path exists for dataset download
+    if not os.path.exists(data_path):
+        os.makedirs(data_path, exist_ok=True)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+
+    is_train_split = (split == "train")
+
+    dataset_kwargs = {
+        'root': data_path,
+        'train': is_train_split,
+        'download': True,
+        'transform': transform
+    }
+
+    dataset = datasets.MNIST(**dataset_kwargs)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=is_train_split,  # Shuffle only for training data
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,  # Optimizer is passed but not used for .step() or .zero_grad() here
+    config: dict,
+) -> torch.Tensor:
+    """
+    Performs ONE forward pass and returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    
+    # Extract inputs and targets from the batch
+    if isinstance(batch, (list, tuple)):
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        inputs = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    inputs, targets = inputs.to(device), targets.to(device)
+
+    # Forward pass
+    outputs = model(inputs)
+
+    # Loss calculation (using F.nll_loss as in the original script)
+    loss = F.nll_loss(outputs, targets)
+    
+    return loss

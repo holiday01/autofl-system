@@ -1,0 +1,328 @@
+"""
+Auto-generated FL client module.
+Original script: PyTorch ImageNet training script (torchvision example)
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import random
+import shutil
+import time
+import warnings
+from enum import Enum
+
+import torch
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn as nn
+import torch.nn.parallel
+import torch.optim
+import torch.utils.data
+import torch.utils.data.distributed
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import Dataset, DataLoader, Subset, random_split
+
+
+# ── Utility classes preserved from original ─────────────────────────────
+
+class Summary(Enum):
+    NONE = 0
+    AVERAGE = 1
+    SUM = 2
+    COUNT = 3
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, use_accel, fmt=':f', summary_type=Summary.AVERAGE):
+        self.name = name
+        self.use_accel = use_accel
+        self.fmt = fmt
+        self.summary_type = summary_type
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def all_reduce(self):
+        if self.use_accel:
+            device = torch.accelerator.current_accelerator()
+        else:
+            device = torch.device("cpu")
+        total = torch.tensor([self.sum, self.count], dtype=torch.float32, device=device)
+        dist.all_reduce(total, dist.ReduceOp.SUM, async_op=False)
+        self.sum, self.count = total.tolist()
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
+
+    def summary(self):
+        fmtstr = ''
+        if self.summary_type is Summary.NONE:
+            fmtstr = ''
+        elif self.summary_type is Summary.AVERAGE:
+            fmtstr = '{name} {avg:.3f}'
+        elif self.summary_type is Summary.SUM:
+            fmtstr = '{name} {sum:.3f}'
+        elif self.summary_type is Summary.COUNT:
+            fmtstr = '{name} {count:.3f}'
+        else:
+            raise ValueError('invalid summary type %r' % self.summary_type)
+        return fmtstr.format(**self.__dict__)
+
+
+class ProgressMeter(object):
+    def __init__(self, num_batches, meters, prefix=""):
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+        self.meters = meters
+        self.prefix = prefix
+
+    def display(self, batch):
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries += [str(meter) for meter in self.meters]
+        print('\t'.join(entries))
+
+    def display_summary(self):
+        entries = [" *"]
+        entries += [meter.summary() for meter in self.meters]
+        print(' '.join(entries))
+
+    def _get_batch_fmtstr(self, num_batches):
+        num_digits = len(str(num_batches // 1))
+        fmt = '{:' + str(num_digits) + 'd}'
+        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
+# ── Dataset helpers ──────────────────────────────────────────────────────
+
+class _TransformSubset(Dataset):
+    """
+    Wraps a random_split Subset drawn from an ImageFolder loaded with
+    transform=None, then applies the requested per-split PIL transform.
+    """
+
+    def __init__(self, subset, transform):
+        self.subset = subset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        img, label = self.subset[idx]   # img is a PIL Image
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+class _SyntheticImageNet(Dataset):
+    """
+    Synthetic ImageNet-sized dataset (3 × 224 × 224 float tensors,
+    integer labels in [0, num_classes)).  Used ONLY when real data is
+    unavailable and config['allow_synthetic_data'] is True.
+    """
+
+    def __init__(self, n: int = 1000, num_classes: int = 1000):
+        self.n = n
+        self.num_classes = num_classes
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        x = torch.randn(3, 224, 224)
+        y = torch.randint(0, self.num_classes, ()).long()
+        return x, y
+
+
+# ── FL Interface ─────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Instantiate a torchvision model.
+
+    Config keys (all optional):
+      arch          : torchvision model name, e.g. "resnet18"  (default: "resnet18")
+      pretrained    : bool — load ImageNet-pretrained weights   (default: False)
+      model_kwargs  : dict passed to the model constructor
+                      (may also contain "arch" and "pretrained" overrides)
+    """
+    model_kwargs = dict(config.get("model_kwargs", {}))
+
+    # Allow arch / pretrained to live either at the top level or inside model_kwargs
+    arch       = model_kwargs.pop("arch",       config.get("arch",       "resnet18"))
+    pretrained = model_kwargs.pop("pretrained", config.get("pretrained", False))
+
+    if arch not in models.__dict__ or not callable(models.__dict__[arch]):
+        raise ValueError(
+            f"Unknown torchvision architecture: '{arch}'. "
+            f"Available architectures: {sorted(n for n in models.__dict__ if n.islower() and not n.startswith('__') and callable(models.__dict__[n]))}"
+        )
+
+    if pretrained:
+        model = models.__dict__[arch](pretrained=True, **model_kwargs)
+    else:
+        model = models.__dict__[arch](**model_kwargs)
+
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+
+    Config keys (all optional):
+      data_path             : root directory that contains an ImageNet-style
+                              'train/' sub-folder  (default: ".")
+      local.batch_size      : mini-batch size       (default: 16)
+      local.num_workers     : DataLoader workers    (default: 4)
+      local.pin_memory      : pin host memory       (default: True)
+      val_ratio             : fraction held out for val  (default: 0.1)
+      seed                  : random_split seed          (default: 42)
+      num_classes           : number of output classes   (default: 1000)
+      synthetic_n           : size of synthetic dataset  (default: 1000)
+      allow_synthetic_data  : MUST be True to use synthetic data (default: False)
+    """
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size",  config.get("batch_size",  16))
+    num_workers = local.get("num_workers", config.get("num_workers", 4))
+    pin_memory  = local.get("pin_memory",  True)
+
+    data_path   = config.get("data_path",   ".")
+    val_ratio   = config.get("val_ratio",   0.1)
+    seed        = config.get("seed",        42)
+    num_classes = config.get("num_classes", 1000)
+
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    train_dir = os.path.join(data_path, "train")
+    real_data_available = os.path.isdir(train_dir) and len(os.listdir(train_dir)) > 0
+
+    if not real_data_available:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"ImageNet training data not found at '{train_dir}'. "
+                "Provide a valid 'data_path' that contains a 'train/' sub-folder "
+                "with ImageFolder-style class directories, or set "
+                "config['allow_synthetic_data'] = True to use synthetic data for testing."
+            )
+        # Synthetic fallback — gated on allow_synthetic_data
+        n_total = config.get("synthetic_n", 1000)
+        full_dataset = _SyntheticImageNet(n=n_total, num_classes=num_classes)
+        n_val   = max(1, int(n_total * val_ratio))
+        n_train = n_total - n_val
+        train_subset, val_subset = random_split(
+            full_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(seed),
+        )
+        ds = train_subset if split == "train" else val_subset
+    else:
+        # Real ImageFolder loaded without transforms so each split gets its own
+        base_dataset = datasets.ImageFolder(train_dir, transform=None)
+        n_total = len(base_dataset)
+        n_val   = max(1, int(n_total * val_ratio))
+        n_train = n_total - n_val
+        train_subset, val_subset = random_split(
+            base_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(seed),
+        )
+        subset    = train_subset    if split == "train" else val_subset
+        transform = train_transform if split == "train" else val_transform
+        ds = _TransformSubset(subset, transform)
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        batch   = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs  = batch[0]
+        targets = batch[1].long()
+    elif isinstance(batch, dict):
+        batch   = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                   for k, v in batch.items()}
+        inputs  = batch.get("input",  batch.get("x",      batch.get("image")))
+        targets = batch.get("label",  batch.get("y",      batch.get("target"))).long()
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs   = model(inputs)
+    criterion = nn.CrossEntropyLoss()
+    loss      = criterion(outputs, targets)
+    return loss

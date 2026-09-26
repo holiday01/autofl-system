@@ -1,0 +1,165 @@
+"""
+Auto-generated FL client module.
+Original script: backbone_image_classifier.py (from Lightning AI examples)
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split, Dataset
+
+# We need torchvision for MNIST dataset and transforms
+from torchvision import transforms
+from torchvision.datasets import MNIST
+
+
+# Default path for downloading MNIST data, relative to this script
+_DEFAULT_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "mnist")
+
+
+class Backbone(nn.Module):
+    """
+    The core neural network model for MNIST classification.
+    """
+    def __init__(self, hidden_dim: int = 128):
+        super().__init__()
+        self.l1 = nn.Linear(28 * 28, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)  # Flatten the image
+        x = F.relu(self.l1(x))
+        return F.relu(self.l2(x))
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Builds and returns the PyTorch model (`nn.Module`) for the FL client.
+
+    Args:
+        config (dict): A dictionary containing configuration parameters,
+                       potentially including 'model_kwargs' for model initialization.
+
+    Returns:
+        nn.Module: The instantiated neural network model.
+    """
+    kwargs = config.get("model_kwargs", {})
+    hidden_dim = kwargs.get("hidden_dim", 128)
+    return Backbone(hidden_dim=hidden_dim)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Builds and returns a PyTorch DataLoader for the specified data split.
+
+    Args:
+        config (dict): A dictionary containing configuration parameters, such as
+                       'batch_size', 'num_workers', 'data_path', and 'seed'.
+        split (str): The data split to load ("train", "val", or "test").
+
+    Returns:
+        DataLoader: The instantiated DataLoader.
+    """
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 32))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+    
+    data_path = config.get("data_path", _DEFAULT_DATA_PATH)
+    seed = config.get("seed", 42)  # Seed used for random_split in original script
+
+    transform = transforms.ToTensor()
+
+    # Load the full MNIST training dataset (60,000 samples)
+    full_train_dataset = MNIST(data_path, train=True, download=True, transform=transform)
+    
+    # Split the full training dataset into client-side training and validation sets
+    # The original script uses 55000 for train and 5000 for val
+    n_train_subset = 55000
+    n_val_subset = 5000
+    
+    # Assert that the split sizes match the full dataset size
+    if not (n_train_subset + n_val_subset == len(full_train_dataset)):
+         raise ValueError(
+             f"Split sizes mismatch: {n_train_subset} + {n_val_subset} != {len(full_train_dataset)}. "
+             "Adjust n_train_subset/n_val_subset or check dataset source."
+         )
+
+    train_ds_client, val_ds_client = random_split(
+        full_train_dataset, [n_train_subset, n_val_subset],
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    # Load the separate MNIST test dataset (10,000 samples)
+    test_ds = MNIST(data_path, train=False, download=True, transform=transform)
+
+    if split == "train":
+        ds = train_ds_client
+        shuffle = True
+    elif split == "val":
+        ds = val_ds_client
+        shuffle = False
+    elif split == "test":
+        ds = test_ds
+        shuffle = False
+    else:
+        raise ValueError(f"Unknown split: {split}. Expected 'train', 'val', or 'test'.")
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,  # Optimizer is passed but not used within train_step as per contract
+    config: dict,  # Configuration dictionary, if needed
+) -> torch.Tensor:
+    """
+    Performs one forward pass and returns the raw loss tensor with grad_fn attached.
+
+    Args:
+        model (nn.Module): The neural network model.
+        batch (tuple | list): A batch of data (inputs, targets).
+        optimizer: The optimizer (not used directly in this function).
+        config (dict): A dictionary containing configuration parameters.
+
+    Returns:
+        torch.Tensor: The raw loss tensor (with grad_fn).
+    """
+    device = next(model.parameters()).device
+    
+    # Assuming batch is a (input, target) tuple from DataLoader
+    if isinstance(batch, (list, tuple)):
+        inputs = batch[0].to(device)
+        targets = batch[1].to(device)
+    elif isinstance(batch, dict):
+        # Handle dict case, though MNIST DataLoader typically yields tuples
+        inputs  = batch.get("input", batch.get("x", batch.get("image"))).to(device)
+        targets = batch.get("label", batch.get("y", batch.get("target"))).to(device)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    loss = F.cross_entropy(outputs, targets)
+    return loss

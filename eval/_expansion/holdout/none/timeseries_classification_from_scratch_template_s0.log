@@ -1,0 +1,12 @@
+  Preflight [eval-client]: PASS  (3.5s)
+  Preflight [eval-site-1]: PASS
+
+Starting FL: 1 rounds, 1 clients
+==================================================
+
+Round 1/1
+    [eval-site-1] loss=2.3316  steps=57  n=228  0.02s
+  Aggregated loss: 2.3316  (0.02s)
+
+FL training complete.
+EVALJSON {"syntax_valid": true, "interface_complete": true, "build_model_present": true, "build_dataloader_present": true, "train_step_present": true, "optimizer_detected": true, "preflight_pass": true, "e2e_runnable": true, "error_stage": "", "error_message": "", "elapsed_sec": 3.54, "data_path": ".", "data_path_exists": true, "strict_data": false, "spec_version": "n/a", "dataset_class": "TensorDataset", "dataset_len": 256, "component_coverage": 1.0}

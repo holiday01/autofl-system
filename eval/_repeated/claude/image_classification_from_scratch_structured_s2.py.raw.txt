@@ -1,0 +1,285 @@
+```python
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+from torchvision import datasets, transforms
+from PIL import Image
+
+
+# ---------------------------------------------------------------------------
+# Architecture: PyTorch equivalent of the Keras mini-Xception model
+# ---------------------------------------------------------------------------
+
+class SeparableConv2d(nn.Module):
+    """Depthwise-separable convolution, equivalent to Keras SeparableConv2D."""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 padding: int = 1, bias: bool = False):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size,
+            padding=padding, groups=in_channels, bias=bias,
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pointwise(self.depthwise(x))
+
+
+class MiniXceptionBlock(nn.Module):
+    """
+    Single residual block from the mini-Xception architecture.
+
+    Matches the Keras loop body exactly:
+        relu -> SepConv -> BN -> relu -> SepConv -> BN -> MaxPool(3, stride=2)
+        + projected residual via Conv2d(1x1, stride=2)
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.sep_conv1 = SeparableConv2d(in_channels, out_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.sep_conv2 = SeparableConv2d(out_channels, out_channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        # MaxPool2d(3, stride=2, padding=1) mirrors Keras MaxPooling2D(3, strides=2, padding="same")
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        # 1x1 strided conv for residual projection (no extra padding needed for kernel=1)
+        self.res_conv = nn.Conv2d(in_channels, out_channels, 1, stride=2, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.res_conv(x)
+        out = F.relu(x)
+        out = self.sep_conv1(out)
+        out = self.bn1(out)
+        out = F.relu(out)
+        out = self.sep_conv2(out)
+        out = self.bn2(out)
+        out = self.maxpool(out)
+        return out + residual
+
+
+class MiniXception(nn.Module):
+    """
+    PyTorch port of the Keras mini-Xception model for binary image classification.
+
+    Expects input of shape (N, 3, H, W) with pixel values in [0, 255].
+    The first operation rescales to [0, 1] matching Keras Rescaling(1./255).
+    Returns logits of shape (N, 1) when num_classes == 2, else (N, num_classes).
+    """
+
+    def __init__(self, input_shape: tuple = (3, 180, 180), num_classes: int = 2):
+        super().__init__()
+
+        # Entry block: Conv2d(3, 128, 3, stride=2, same) + BN + ReLU
+        # padding=1 reproduces Keras padding="same" at stride=2 for 180px input
+        self.entry_conv = nn.Conv2d(3, 128, 3, stride=2, padding=1, bias=False)
+        self.entry_bn = nn.BatchNorm2d(128)
+
+        # Residual blocks: 128 -> 256 -> 512 -> 728
+        channel_progression = [128, 256, 512, 728]
+        self.res_blocks = nn.ModuleList([
+            MiniXceptionBlock(channel_progression[i], channel_progression[i + 1])
+            for i in range(len(channel_progression) - 1)
+        ])
+
+        # Top separable conv block
+        self.top_sep_conv = SeparableConv2d(728, 1024, 3, padding=1)
+        self.top_bn = nn.BatchNorm2d(1024)
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.25)
+        units = 1 if num_classes == 2 else num_classes
+        self.fc = nn.Linear(1024, units)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Rescaling [0, 255] -> [0, 1]  (matches Keras Rescaling(1./255))
+        x = x / 255.0
+
+        # Entry block
+        x = F.relu(self.entry_bn(self.entry_conv(x)))
+
+        # Residual blocks
+        for block in self.res_blocks:
+            x = block(x)
+
+        # Top block
+        x = F.relu(self.top_bn(self.top_sep_conv(x)))
+
+        # Classification head
+        x = self.gap(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+
+# ---------------------------------------------------------------------------
+# Helper: subset wrapper that applies a per-split transform
+# ---------------------------------------------------------------------------
+
+class _TransformSubset(Dataset):
+    """
+    Wraps a random_split Subset and applies an independent transform per split,
+    bypassing the base dataset's own transform by loading files directly.
+    """
+
+    def __init__(self, base_dataset: datasets.ImageFolder,
+                 indices: list, transform: transforms.Compose):
+        self.base = base_dataset
+        self.indices = indices
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        path, label = self.base.samples[self.indices[idx]]
+        img = Image.open(path).convert("RGB")
+        return self.transform(img), label
+
+
+# ---------------------------------------------------------------------------
+# FL API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Instantiate and return the MiniXception model.
+
+    Reads:
+      config["model_kwargs"]  optional dict of MiniXception constructor kwargs
+                              e.g. {"num_classes": 2, "input_shape": [3, 180, 180]}
+    """
+    kwargs = config.get("model_kwargs", {})
+    return MiniXception(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+
+    Reads:
+      config["local"]["batch_size"]  (default 16)
+      config["data_path"]            (default ".")  -- must contain PetImages/
+      config["image_size"]           (default (180, 180))
+      config["val_fraction"]         (default 0.2)
+      config["seed"]                 (default 1337)
+      config["allow_synthetic_data"] (default False)
+
+    Raises FileNotFoundError when PetImages/ is absent and synthetic data is disabled.
+    """
+    local_cfg = config.get("local", {})
+    batch_size = local_cfg.get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    image_size = tuple(config.get("image_size", (180, 180)))
+    val_fraction = config.get("val_fraction", 0.2)
+    seed = config.get("seed", 1337)
+
+    pet_dir = os.path.join(data_path, "PetImages")
+
+    # ── Synthetic fallback (only when explicitly enabled) ──────────────────
+    if not os.path.isdir(pet_dir):
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"PetImages directory not found at '{pet_dir}'. "
+                "Provide the Kaggle Cats vs Dogs dataset under data_path, "
+                "or set config['allow_synthetic_data'] = True to use "
+                "synthetic data for debugging."
+            )
+        # Synthetic tensors: pixel values in [0, 255] to match real pipeline
+        n = 200
+        h, w = image_size
+        X = torch.randint(0, 256, (n, 3, h, w)).float()
+        y = torch.randint(0, 2, (n,)).float()
+        dataset = TensorDataset(X, y)
+        n_val = max(1, int(n * val_fraction))
+        n_train = n - n_val
+        generator = torch.Generator().manual_seed(seed)
+        train_ds, val_ds = random_split(dataset, [n_train, n_val],
+                                        generator=generator)
+        chosen = train_ds if split == "train" else val_ds
+        return DataLoader(chosen, batch_size=batch_size,
+                          shuffle=(split == "train"))
+
+    # ── Real data path ─────────────────────────────────────────────────────
+    # The model performs rescaling [0,255]->[0,1] internally, so we keep
+    # pixel values in float32 [0, 255] here to match the Keras pipeline.
+    _to_float255 = transforms.Lambda(lambda t: t * 255.0)
+
+    # Training: random horizontal flip + ±36° rotation (= ±10% × 360°,
+    #           matching Keras RandomFlip("horizontal") + RandomRotation(0.1))
+    train_transform = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(degrees=36),
+        transforms.ToTensor(),
+        _to_float255,
+    ])
+
+    # Validation: resize only, no augmentation
+    val_transform = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+        _to_float255,
+    ])
+
+    # Build index (no per-item transform applied at this stage)
+    base_dataset = datasets.ImageFolder(pet_dir)
+
+    n_total = len(base_dataset)
+    n_val = max(1, int(n_total * val_fraction))
+    n_train = n_total - n_val
+    generator = torch.Generator().manual_seed(seed)
+    train_subset, val_subset = random_split(
+        base_dataset, [n_train, n_val], generator=generator
+    )
+
+    if split == "train":
+        ds = _TransformSubset(base_dataset,
+                              list(train_subset.indices), train_transform)
+        return DataLoader(ds, batch_size=batch_size, shuffle=True,
+                          num_workers=4, pin_memory=True)
+    else:
+        ds = _TransformSubset(base_dataset,
+                              list(val_subset.indices), val_transform)
+        return DataLoader(ds, batch_size=batch_size, shuffle=False,
+                          num_workers=4, pin_memory=True)
+
+
+def train_step(model: nn.Module, batch, optimizer,
+               config: dict) -> torch.Tensor:
+    """
+    Single forward pass.  Returns the scalar loss tensor WITH gradients.
+
+    NOTE: loss.backward() and optimizer.step() are intentionally omitted;
+    the FL runtime is responsible for the backward pass and weight update.
+    """
+    device = next(model.parameters()).device
+    images, labels = batch
+    images = images.to(device)
+    labels = labels.to(device).float()
+
+    # model returns (N, 1) logits for binary classification; squeeze to (N,)
+    logits = model(images).squeeze(1)
+    loss = F.binary_cross_entropy_with_logits(logits, labels)
+    return loss
+```
+
+---
+
+### Key conversion decisions
+
+| Keras construct | PyTorch equivalent | Notes |
+|---|---|---|
+| `Rescaling(1./255)` | `x / 255.0` in `forward()` | Built into the model so the FL runtime doesn't have to care |
+| `SeparableConv2D(size, 3)` | `SeparableConv2d` — depthwise `groups=C` + pointwise 1×1 | Exact channel-wise split |
+| `Conv2D(…, padding="same", strides=2)` | `padding=1` for 3×3 kernel | `⌈180/2⌉ = 90` matches both frameworks |
+| `MaxPooling2D(3, strides=2, padding="same")` | `MaxPool2d(3, stride=2, padding=1)` | Same spatial output size |
+| `GlobalAveragePooling2D` | `AdaptiveAvgPool2d(1)` + `flatten` | |
+| `BinaryCrossentropy(from_logits=True)` | `F.binary_cross_entropy_with_logits` | |
+| `image_dataset_from_directory` | `datasets.ImageFolder` + `_TransformSubset` | Splits via `random_split`; per-split transforms applied cleanly |
+| Keras `RandomFlip + RandomRotation(0.1)` | `RandomHorizontalFlip + RandomRotation(36°)` | 0.1 × 360° = 36° |
+
+The **synthetic-data fallback** is strictly gated on `config["allow_synthetic_data"] = True`; otherwise a `FileNotFoundError` with a clear message is raised.

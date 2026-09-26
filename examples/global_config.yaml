@@ -1,0 +1,35 @@
+# ============================================================
+# Admin-controlled global config (sent to ALL clients)
+# Keys NOT in allowed_overrides are LOCKED — clients cannot change them.
+# ============================================================
+
+# --- Locked (FL protocol) ---
+num_rounds: 10
+local_epochs: 2
+clients_per_round: 2
+learning_rate: 0.0003
+aggregation_algorithm: FedAvg
+seed: 42
+loss_function: CrossEntropyLoss
+
+# --- Model & data ---
+model_kwargs: {}           # passed to build_model(config)
+dataset_kwargs: {}         # passed to build_dataloader(config)
+data_path: ./data
+val_ratio: 0.1
+
+# --- Defaults (overridable by clients) ---
+batch_size: 16
+num_workers: 2
+use_amp: false
+gradient_accumulation: 1
+pin_memory: true
+
+# --- Which params clients MAY override (hardware-adaptive) ---
+allowed_overrides:
+  - batch_size
+  - num_workers
+  - use_amp
+  - gradient_accumulation
+  - pin_memory
+  - prefetch_factor

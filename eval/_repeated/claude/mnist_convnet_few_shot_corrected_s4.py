@@ -1,0 +1,140 @@
+"""
+Auto-generated FL client module.
+Original script: Simple MNIST convnet (fchollet, keras.io, 2015/06/19)
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+
+try:
+    from torchvision import datasets, transforms
+    _TORCHVISION = True
+except ImportError:
+    _TORCHVISION = False
+
+
+class MNISTConvNet(nn.Module):
+    def __init__(self, num_classes: int = 10, dropout: float = 0.5):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+        # After Conv/Pool chain: (28->26->13->11->5), so 64 * 5 * 5 = 1600
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(64 * 5 * 5, num_classes),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+
+
+class SyntheticMNISTDataset(Dataset):
+    """Synthetic fallback when torchvision is unavailable."""
+
+    def __init__(self, n: int = 1000, num_classes: int = 10):
+        self.x = torch.randn(n, 1, 28, 28)
+        self.y = torch.randint(0, num_classes, (n,))
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return MNISTConvNet(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 128))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", "./data")
+    val_ratio = config.get("val_ratio", 0.1)
+    seed      = config.get("seed", 42)
+
+    if _TORCHVISION:
+        tfm = transforms.Compose([transforms.ToTensor()])
+        if split == "test":
+            ds = datasets.MNIST(root=data_path, train=False, download=True, transform=tfm)
+        else:
+            full = datasets.MNIST(root=data_path, train=True, download=True, transform=tfm)
+            n_val   = max(1, int(len(full) * val_ratio))
+            n_train = len(full) - n_val
+            train_ds, val_ds = random_split(
+                full, [n_train, n_val],
+                generator=torch.Generator().manual_seed(seed),
+            )
+            ds = train_ds if split == "train" else val_ds
+    else:
+        num_classes = config.get("model_kwargs", {}).get("num_classes", 10)
+        full = SyntheticMNISTDataset(n=config.get("synthetic_n", 1000), num_classes=num_classes)
+        n_val   = max(1, int(len(full) * val_ratio))
+        n_train = len(full) - n_val
+        train_ds, val_ds = random_split(
+            full, [n_train, n_val],
+            generator=torch.Generator().manual_seed(seed),
+        )
+        ds = train_ds if split in ("train", "test") else val_ds
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    loss = nn.CrossEntropyLoss()(outputs, targets)
+    return loss

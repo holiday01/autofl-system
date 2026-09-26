@@ -1,0 +1,115 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: vae_mnist_train.py
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+
+class VAE(nn.Module):
+    def __init__(self, input_dim=784, hidden_dim=400, latent_dim=20):
+        super().__init__()
+        self.fc1  = nn.Linear(input_dim, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim, latent_dim)
+        self.fc22 = nn.Linear(hidden_dim, latent_dim)
+        self.fc3  = nn.Linear(latent_dim, hidden_dim)
+        self.fc4  = nn.Linear(hidden_dim, input_dim)
+
+    def encode(self, x):
+        h1 = F.relu(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        h3 = F.relu(self.fc3(z))
+        return torch.sigmoid(self.fc4(h3))
+
+    def forward(self, x):
+        mu, logvar = self.encode(x.view(-1, 784))
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+
+def _vae_loss(recon_x, x, mu, logvar):
+    bce = F.binary_cross_entropy(recon_x, x.view(-1, 784), reduction='sum')
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return bce + kld
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return VAE(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 128))
+    num_workers = local.get("num_workers", config.get("num_workers", 1))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", "../data")
+    is_train = split == "train"
+    dataset = datasets.MNIST(
+        data_path,
+        train=is_train,
+        download=True,
+        transform=transforms.ToTensor(),
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=is_train,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        data = batch[0]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        data = batch.get("input", batch.get("x", batch.get("image")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    recon_batch, mu, logvar = model(data)
+    loss = _vae_loss(recon_batch, data, mu, logvar)
+    return loss
+```

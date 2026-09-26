@@ -1,0 +1,233 @@
+import argparse
+import os
+import random
+import shutil
+import time
+import warnings
+from enum import Enum
+
+import torch
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn as nn
+import torch.nn.parallel
+import torch.optim
+import torch.utils.data
+import torch.utils.data.distributed
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
+
+
+# ── internal helpers ──────────────────────────────────────────────────────────
+
+class _TransformDataset(Dataset):
+    """Wraps a base dataset (no transform) and applies a caller-supplied transform.
+
+    This lets train and val subsets—carved from the same random_split—receive
+    their own augmentation pipelines without loading the source data twice.
+    """
+
+    def __init__(self, base_dataset: Dataset, transform):
+        self.base_dataset = base_dataset
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        img, label = self.base_dataset[idx]
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+class _SyntheticImageNet(Dataset):
+    """Synthetic stand-in for ImageNet (only used when allow_synthetic_data=True)."""
+
+    def __init__(self, length: int = 1000, num_classes: int = 1000):
+        self.length = length
+        self.num_classes = num_classes
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx):
+        image = torch.randn(3, 224, 224)
+        label = torch.randint(0, self.num_classes, (1,)).item()
+        return image, label
+
+
+# ── FL interface ──────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate a torchvision model.
+
+    Keys consumed from config["model_kwargs"]:
+        arch  (str)  – torchvision model name, default "resnet18"
+        All remaining entries are forwarded verbatim to the constructor, e.g.
+        weights="IMAGENET1K_V1", num_classes=10, etc.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    arch = model_kwargs.get("arch", "resnet18")
+    constructor_kwargs = {k: v for k, v in model_kwargs.items() if k != "arch"}
+
+    _available = {
+        name for name in models.__dict__
+        if name.islower()
+        and not name.startswith("__")
+        and callable(models.__dict__[name])
+    }
+    if arch not in _available:
+        raise ValueError(
+            f"Unknown torchvision architecture: '{arch}'. "
+            f"Available: {sorted(_available)}"
+        )
+
+    return models.__dict__[arch](**constructor_kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for *split* ("train" or "val").
+
+    Dataset discovery
+    -----------------
+    Looks for an ImageFolder-compatible tree at config["data_path"] by
+    checking ``<data_path>/train/`` first, then ``<data_path>`` itself.
+    A single source dataset is loaded (without transforms) and split with
+    random_split so that train and val cover disjoint, reproducible indices.
+    Per-split ImageNet transforms (random-crop/flip for train, resize/
+    centre-crop for val) are applied via a lightweight wrapper.
+
+    Synthetic fallback
+    ------------------
+    When no real data is found and config["allow_synthetic_data"] is True,
+    a _SyntheticImageNet dataset is used instead.  If that flag is False (or
+    absent), FileNotFoundError is raised — synthetic data is never used
+    silently.
+
+    Config keys read
+    ----------------
+    data_path            (str)   root of the ImageNet-style tree, default "."
+    local.batch_size     (int)   default 16
+    local.num_workers    (int)   default 2
+    val_ratio            (float) fraction held out for val, default 0.2
+    seed                 (int)   random_split seed, default 42
+    allow_synthetic_data (bool)  gate for synthetic fallback, default False
+    synthetic_length     (int)   synthetic dataset size, default 1000
+    num_classes          (int)   synthetic label range, default 1000
+    """
+    local_cfg = config.get("local", {})
+    batch_size = local_cfg.get("batch_size", 16)
+    num_workers = local_cfg.get("num_workers", 2)
+    data_path = config.get("data_path", ".")
+    val_ratio = config.get("val_ratio", 0.2)
+    seed = config.get("seed", 42)
+
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    # ── locate real data ──────────────────────────────────────────────────────
+    base_dataset = None
+    candidates = [os.path.join(data_path, "train"), data_path]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            try:
+                # Load without transforms so _TransformDataset can apply the
+                # correct pipeline per split.
+                base_dataset = datasets.ImageFolder(candidate, transform=None)
+                break
+            except Exception:
+                continue
+
+    # ── synthetic fallback (strictly gated) ──────────────────────────────────
+    if base_dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"No ImageFolder-compatible dataset found at '{data_path}' "
+                f"(also tried '{os.path.join(data_path, 'train')}'). "
+                "Point config['data_path'] to a valid ImageNet-style directory, "
+                "or set config['allow_synthetic_data'] = True to use synthetic data."
+            )
+        synthetic_length = config.get("synthetic_length", 1000)
+        num_classes = config.get("num_classes", 1000)
+        full_dataset: Dataset = _SyntheticImageNet(
+            length=synthetic_length, num_classes=num_classes
+        )
+        total = len(full_dataset)
+        val_size = max(1, int(total * val_ratio))
+        train_size = total - val_size
+        generator = torch.Generator().manual_seed(seed)
+        train_subset, val_subset = random_split(
+            full_dataset, [train_size, val_size], generator=generator
+        )
+        chosen = train_subset if split == "train" else val_subset
+
+    else:
+        # ── real data: split → per-split transform wrapper ────────────────────
+        total = len(base_dataset)
+        val_size = max(1, int(total * val_ratio))
+        train_size = total - val_size
+        generator = torch.Generator().manual_seed(seed)
+        train_subset, val_subset = random_split(
+            base_dataset, [train_size, val_size], generator=generator
+        )
+
+        transform = train_transform if split == "train" else val_transform
+        indices = (
+            train_subset.indices if split == "train" else val_subset.indices
+        )
+        # Wrap the *untransformed* base dataset with the chosen transform,
+        # then select only the indices belonging to this split.
+        chosen = Subset(_TransformDataset(base_dataset, transform), indices)
+
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Single forward pass; returns the loss tensor with its grad function attached.
+
+    Constraints (FL runtime contract)
+    ----------------------------------
+    • Does NOT call loss.backward().
+    • Does NOT call optimizer.step().
+    Both are the exclusive responsibility of the FL runtime.
+    """
+    images, target = batch
+    device = next(model.parameters()).device
+    images = images.to(device, non_blocking=True)
+    target = target.to(device, non_blocking=True)
+
+    model.train()
+    output = model(images)
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(output, target)
+    return loss

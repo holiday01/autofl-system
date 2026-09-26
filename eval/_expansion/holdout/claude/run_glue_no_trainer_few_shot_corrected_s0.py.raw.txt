@@ -1,0 +1,223 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: HuggingFace GLUE sequence classification fine-tuning script.
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from datasets import load_dataset
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    default_data_collator,
+)
+
+task_to_keys = {
+    "cola": ("sentence", None),
+    "mnli": ("premise", "hypothesis"),
+    "mrpc": ("sentence1", "sentence2"),
+    "qnli": ("question", "sentence"),
+    "qqp": ("question1", "question2"),
+    "rte": ("sentence1", "sentence2"),
+    "sst2": ("sentence", None),
+    "stsb": ("sentence1", "sentence2"),
+    "wnli": ("sentence1", "sentence2"),
+}
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    task_name = config.get("task_name", None)
+    is_regression = task_name == "stsb"
+
+    if task_name is not None:
+        raw_datasets = load_dataset("nyu-mll/glue", task_name)
+        if not is_regression:
+            num_labels = len(raw_datasets["train"].features["label"].names)
+        else:
+            num_labels = 1
+    else:
+        num_labels = config.get("num_labels", 2)
+
+    model_name_or_path = config["model_name_or_path"]
+    trust_remote_code = config.get("trust_remote_code", False)
+    ignore_mismatched_sizes = config.get("ignore_mismatched_sizes", False)
+
+    hf_config = AutoConfig.from_pretrained(
+        model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=task_name,
+        trust_remote_code=trust_remote_code,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path,
+        use_fast=not config.get("use_slow_tokenizer", False),
+        trust_remote_code=trust_remote_code,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    hf_config.pad_token_id = tokenizer.pad_token_id
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name_or_path,
+        from_tf=bool(".ckpt" in model_name_or_path),
+        config=hf_config,
+        ignore_mismatched_sizes=ignore_mismatched_sizes,
+        trust_remote_code=trust_remote_code,
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size = local.get("batch_size", config.get("per_device_train_batch_size", 8))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory = local.get("pin_memory", True)
+
+    task_name = config.get("task_name", None)
+    model_name_or_path = config["model_name_or_path"]
+    max_length = config.get("max_length", 128)
+    pad_to_max_length = config.get("pad_to_max_length", False)
+    trust_remote_code = config.get("trust_remote_code", False)
+
+    if task_name is not None:
+        raw_datasets = load_dataset("nyu-mll/glue", task_name)
+        is_regression = task_name == "stsb"
+        if not is_regression:
+            label_list = raw_datasets["train"].features["label"].names
+            num_labels = len(label_list)
+        else:
+            num_labels = 1
+            label_list = None
+    else:
+        train_file = config.get("train_file")
+        validation_file = config.get("validation_file")
+        data_files = {}
+        if train_file:
+            data_files["train"] = train_file
+        if validation_file:
+            data_files["validation"] = validation_file
+        extension = (train_file if train_file else validation_file).split(".")[-1]
+        raw_datasets = load_dataset(extension, data_files=data_files)
+        is_regression = raw_datasets["train"].features["label"].dtype in ["float32", "float64"]
+        if is_regression:
+            num_labels = 1
+            label_list = None
+        else:
+            label_list = sorted(raw_datasets["train"].unique("label"))
+            num_labels = len(label_list)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path,
+        use_fast=not config.get("use_slow_tokenizer", False),
+        trust_remote_code=trust_remote_code,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if task_name is not None:
+        sentence1_key, sentence2_key = task_to_keys[task_name]
+    else:
+        non_label_cols = [n for n in raw_datasets["train"].column_names if n != "label"]
+        if "sentence1" in non_label_cols and "sentence2" in non_label_cols:
+            sentence1_key, sentence2_key = "sentence1", "sentence2"
+        elif len(non_label_cols) >= 2:
+            sentence1_key, sentence2_key = non_label_cols[0], non_label_cols[1]
+        else:
+            sentence1_key, sentence2_key = non_label_cols[0], None
+
+    label_to_id = None
+    if task_name is None and not is_regression and label_list is not None:
+        label_to_id = {v: i for i, v in enumerate(label_list)}
+
+    padding = "max_length" if pad_to_max_length else False
+
+    def preprocess_function(examples):
+        texts = (
+            (examples[sentence1_key],)
+            if sentence2_key is None
+            else (examples[sentence1_key], examples[sentence2_key])
+        )
+        result = tokenizer(*texts, padding=padding, max_length=max_length, truncation=True)
+        if "label" in examples:
+            if label_to_id is not None:
+                result["labels"] = [label_to_id[l] for l in examples["label"]]
+            else:
+                result["labels"] = examples["label"]
+        return result
+
+    processed_datasets = raw_datasets.map(
+        preprocess_function,
+        batched=True,
+        remove_columns=raw_datasets["train"].column_names,
+        desc="Running tokenizer on dataset",
+    )
+
+    if split == "train":
+        ds = processed_datasets["train"]
+        shuffle = True
+    else:
+        val_key = "validation_matched" if task_name == "mnli" else "validation"
+        ds = processed_datasets[val_key]
+        shuffle = False
+
+    if pad_to_max_length:
+        data_collator = default_data_collator
+    else:
+        data_collator = DataCollatorWithPadding(tokenizer)
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=data_collator,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list | dict,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        inputs = {
+            "input_ids": batch[0].to(device),
+            "attention_mask": batch[1].to(device),
+            "labels": batch[2].to(device),
+        }
+    elif isinstance(batch, dict):
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(**inputs)
+    return outputs.loss
+```

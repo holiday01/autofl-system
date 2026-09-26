@@ -1,0 +1,155 @@
+"""
+Auto-generated FL client module.
+Original script: torchvision ImageNet training (main.py)
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+
+import torch
+import torch.nn as nn
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, random_split
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    arch = config.get("arch", "resnet18")
+    pretrained = config.get("pretrained", False)
+    num_classes = config.get("num_classes", 1000)
+
+    if pretrained:
+        model = models.__dict__[arch](weights="DEFAULT")
+    else:
+        model = models.__dict__[arch]()
+
+    if num_classes != 1000:
+        if hasattr(model, "fc"):
+            in_features = model.fc.in_features
+            model.fc = nn.Linear(in_features, num_classes)
+        elif hasattr(model, "classifier"):
+            if isinstance(model.classifier, nn.Sequential):
+                in_features = model.classifier[-1].in_features
+                model.classifier[-1] = nn.Linear(in_features, num_classes)
+            else:
+                in_features = model.classifier.in_features
+                model.classifier = nn.Linear(in_features, num_classes)
+
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 32))
+    num_workers = local.get("num_workers", config.get("num_workers", 4))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", "imagenet")
+    dummy     = config.get("dummy", False)
+    val_ratio = config.get("val_ratio", None)
+
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    if dummy:
+        from torchvision.datasets import FakeData
+        n_train, n_val = config.get("dummy_train_size", 1281167), config.get("dummy_val_size", 50000)
+        num_classes = config.get("num_classes", 1000)
+        if split == "train":
+            dataset = FakeData(n_train, (3, 224, 224), num_classes, train_transform)
+        else:
+            dataset = FakeData(n_val, (3, 224, 224), num_classes, val_transform)
+    elif val_ratio is not None:
+        # single root directory — split by ratio
+        full_dataset = datasets.ImageFolder(data_path, transform=train_transform)
+        n_val = max(1, int(len(full_dataset) * val_ratio))
+        n_train = len(full_dataset) - n_val
+        train_ds, val_ds = random_split(
+            full_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(config.get("seed", 42)),
+        )
+        if split == "train":
+            dataset = train_ds
+        else:
+            # re-wrap val subset with val transform
+            val_ds.dataset.transform = val_transform
+            dataset = val_ds
+    else:
+        # standard ImageNet layout: data_path/train and data_path/val
+        if split == "train":
+            dataset = datasets.ImageFolder(
+                os.path.join(data_path, "train"),
+                transform=train_transform,
+            )
+        else:
+            dataset = datasets.ImageFolder(
+                os.path.join(data_path, "val"),
+                transform=val_transform,
+            )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass. Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device, non_blocking=True) if isinstance(b, torch.Tensor) else b
+                 for b in batch]
+        images, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        images  = batch.get("image", batch.get("input", batch.get("x")))
+        targets = batch.get("label", batch.get("target", batch.get("y")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(images)
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(outputs, targets)
+    return loss

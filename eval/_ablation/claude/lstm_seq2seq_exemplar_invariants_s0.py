@@ -1,0 +1,225 @@
+"""
+Auto-generated FL client module.
+Original script: character-level LSTM encoder-decoder seq2seq (English → French).
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
+
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+
+class Seq2SeqCharDataset(Dataset):
+    """Character-level English→French dataset from fra-eng tab-separated file.
+
+    Yields (encoder_input, decoder_input, decoder_target) as float32 one-hot tensors.
+    """
+
+    def __init__(self, data_path: str, num_samples: int = 10000):
+        input_texts, target_texts = [], []
+        input_characters: set = set()
+        target_characters: set = set()
+
+        with open(data_path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+
+        for line in lines[: min(num_samples, len(lines) - 1)]:
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            input_text, target_text = parts[0], parts[1]
+            target_text = "\t" + target_text + "\n"
+            input_texts.append(input_text)
+            target_texts.append(target_text)
+            input_characters.update(input_text)
+            target_characters.update(target_text)
+
+        input_characters = sorted(input_characters)
+        target_characters = sorted(target_characters)
+        input_token_index  = {c: i for i, c in enumerate(input_characters)}
+        target_token_index = {c: i for i, c in enumerate(target_characters)}
+
+        num_encoder_tokens    = len(input_characters)
+        num_decoder_tokens    = len(target_characters)
+        max_encoder_seq_length = max(len(t) for t in input_texts)
+        max_decoder_seq_length = max(len(t) for t in target_texts)
+
+        n = len(input_texts)
+        enc_data = np.zeros((n, max_encoder_seq_length, num_encoder_tokens), dtype=np.float32)
+        dec_in   = np.zeros((n, max_decoder_seq_length, num_decoder_tokens), dtype=np.float32)
+        dec_tgt  = np.zeros((n, max_decoder_seq_length, num_decoder_tokens), dtype=np.float32)
+
+        for i, (inp, tgt) in enumerate(zip(input_texts, target_texts)):
+            for t, ch in enumerate(inp):
+                enc_data[i, t, input_token_index[ch]] = 1.0
+            enc_data[i, t + 1:, input_token_index.get(" ", 0)] = 1.0
+            for t, ch in enumerate(tgt):
+                dec_in[i, t, target_token_index[ch]] = 1.0
+                if t > 0:
+                    dec_tgt[i, t - 1, target_token_index[ch]] = 1.0
+            dec_in[i, t + 1:, target_token_index.get(" ", 0)] = 1.0
+            dec_tgt[i, t:,    target_token_index.get(" ", 0)] = 1.0
+
+        self.encoder_input  = torch.from_numpy(enc_data)
+        self.decoder_input  = torch.from_numpy(dec_in)
+        self.decoder_target = torch.from_numpy(dec_tgt)
+
+        self.num_encoder_tokens    = num_encoder_tokens
+        self.num_decoder_tokens    = num_decoder_tokens
+        self.max_encoder_seq_length = max_encoder_seq_length
+        self.max_decoder_seq_length = max_decoder_seq_length
+
+    def __len__(self) -> int:
+        return len(self.encoder_input)
+
+    def __getitem__(self, idx):
+        return self.encoder_input[idx], self.decoder_input[idx], self.decoder_target[idx]
+
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+
+class Seq2SeqLSTM(nn.Module):
+    def __init__(
+        self,
+        num_encoder_tokens: int,
+        num_decoder_tokens: int,
+        latent_dim: int = 256,
+    ):
+        super().__init__()
+        self.encoder_lstm = nn.LSTM(num_encoder_tokens, latent_dim, batch_first=True)
+        self.decoder_lstm = nn.LSTM(num_decoder_tokens, latent_dim, batch_first=True)
+        self.decoder_dense = nn.Linear(latent_dim, num_decoder_tokens)
+
+    def forward(
+        self,
+        encoder_input: torch.Tensor,
+        decoder_input: torch.Tensor,
+    ) -> torch.Tensor:
+        _, (h, c) = self.encoder_lstm(encoder_input)
+        decoder_out, _ = self.decoder_lstm(decoder_input, (h, c))
+        return self.decoder_dense(decoder_out)
+
+
+# ── FL Interface ───────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    num_encoder_tokens = kwargs.get("num_encoder_tokens")
+    num_decoder_tokens = kwargs.get("num_decoder_tokens")
+
+    if num_encoder_tokens is None or num_decoder_tokens is None:
+        data_path = config.get("data_path", "fra.txt")
+        if not os.path.isfile(data_path):
+            raise ValueError(
+                "num_encoder_tokens and num_decoder_tokens must be provided in "
+                "config['model_kwargs'] when data_path is unavailable."
+            )
+        ds = Seq2SeqCharDataset(data_path, num_samples=config.get("num_samples", 10000))
+        num_encoder_tokens = ds.num_encoder_tokens
+        num_decoder_tokens = ds.num_decoder_tokens
+
+    latent_dim = kwargs.get("latent_dim", 256)
+    return Seq2SeqLSTM(num_encoder_tokens, num_decoder_tokens, latent_dim)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size",  config.get("batch_size",  64))
+    num_workers = local.get("num_workers", config.get("num_workers",  2))
+    pin_memory  = local.get("pin_memory",  True)
+
+    data_path   = config.get("data_path", "fra.txt")
+    num_samples = config.get("num_samples", 10000)
+
+    if not os.path.isfile(data_path):
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Data file not found: {data_path!r}. "
+                "Set config['allow_synthetic_data'] = True to use synthetic data."
+            )
+        model_kwargs       = config.get("model_kwargs", {})
+        num_encoder_tokens = model_kwargs.get("num_encoder_tokens", 71)
+        num_decoder_tokens = model_kwargs.get("num_decoder_tokens", 93)
+        max_enc = config.get("max_encoder_seq_length", 16)
+        max_dec = config.get("max_decoder_seq_length", 59)
+        n = min(num_samples, 200)
+
+        enc     = torch.zeros(n, max_enc, num_encoder_tokens)
+        dec_in  = torch.zeros(n, max_dec, num_decoder_tokens)
+        dec_tgt = torch.zeros(n, max_dec, num_decoder_tokens)
+        enc.scatter_(2,     torch.randint(0, num_encoder_tokens, (n, max_enc)).unsqueeze(2), 1.0)
+        dec_in.scatter_(2,  torch.randint(0, num_decoder_tokens, (n, max_dec)).unsqueeze(2), 1.0)
+        dec_tgt.scatter_(2, torch.randint(0, num_decoder_tokens, (n, max_dec)).unsqueeze(2), 1.0)
+        full_dataset = TensorDataset(enc, dec_in, dec_tgt)
+    else:
+        full_dataset = Seq2SeqCharDataset(data_path, num_samples=num_samples)
+
+    val_ratio = config.get("val_ratio", 0.2)
+    n_val     = max(1, int(len(full_dataset) * val_ratio))
+    n_train   = len(full_dataset) - n_val
+    train_ds, val_ds = random_split(
+        full_dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(config.get("seed", 42)),
+    )
+    ds = train_ds if split == "train" else val_ds
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass. Returns raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        encoder_input, decoder_input, decoder_target = batch[0], batch[1], batch[2]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        encoder_input  = batch["encoder_input"]
+        decoder_input  = batch["decoder_input"]
+        decoder_target = batch["decoder_target"]
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    logits = model(encoder_input, decoder_input)  # (batch, seq_len, num_decoder_tokens)
+
+    # decoder_target is one-hot; convert to class indices for CrossEntropyLoss.
+    target_indices = decoder_target.argmax(dim=-1)  # (batch, seq_len)
+
+    batch_sz, seq_len, num_tokens = logits.shape
+    loss = F.cross_entropy(
+        logits.reshape(batch_sz * seq_len, num_tokens),
+        target_indices.reshape(batch_sz * seq_len),
+    )
+    return loss

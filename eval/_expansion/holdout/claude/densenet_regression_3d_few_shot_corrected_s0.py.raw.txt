@@ -1,0 +1,120 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: MONAI 3D regression (densenet_training_array) — IXI brain age regression.
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+
+config keys:
+  model_kwargs:  in_shape, out_shape, channels, strides
+  image_files:   list of absolute NIfTI paths (required)
+  labels:        list/array of regression targets, e.g. ages (required)
+  image_size:    spatial size after Resize, default [96, 96, 96]
+  val_ratio:     fraction held out for validation, default 0.2
+  batch_size:    default 2
+  num_workers:   default 2
+  local.*:       per-client overrides for batch_size / num_workers / pin_memory
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+from monai.data import DataLoader, ImageDataset
+from monai.networks.nets import Regressor
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirst,
+    RandRotate90,
+    Resize,
+    ScaleIntensity,
+)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    in_shape = kwargs.get("in_shape", [1, 96, 96, 96])
+    out_shape = kwargs.get("out_shape", 1)
+    channels = tuple(kwargs.get("channels", (16, 32, 64, 128, 256)))
+    strides = tuple(kwargs.get("strides", (2, 2, 2, 2)))
+    return Regressor(in_shape=in_shape, out_shape=out_shape, channels=channels, strides=strides)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 2))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    image_files = config.get("image_files")
+    labels = config.get("labels")
+    if image_files is None or labels is None:
+        raise ValueError("config must provide 'image_files' (list of paths) and 'labels' (list/array of targets)")
+
+    labels = np.array(labels, dtype=np.float32)
+    image_size = tuple(config.get("image_size", (96, 96, 96)))
+
+    val_ratio = config.get("val_ratio", 0.2)
+    n_total = len(image_files)
+    n_train = max(1, int(n_total * (1.0 - val_ratio)))
+
+    train_transforms = Compose([ScaleIntensity(), EnsureChannelFirst(), Resize(image_size), RandRotate90()])
+    val_transforms   = Compose([ScaleIntensity(), EnsureChannelFirst(), Resize(image_size)])
+
+    if split == "train":
+        ds = ImageDataset(image_files=image_files[:n_train], labels=labels[:n_train], transform=train_transforms)
+    else:
+        ds = ImageDataset(image_files=image_files[n_train:], labels=labels[n_train:], transform=val_transforms)
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    # Regressor returns (B, 1); align targets shape before MSE
+    targets = targets.float()
+    if targets.shape != outputs.shape:
+        targets = targets.view_as(outputs)
+    criterion = nn.MSELoss()
+    loss = criterion(outputs, targets)
+    return loss
+```

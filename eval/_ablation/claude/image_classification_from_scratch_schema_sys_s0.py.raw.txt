@@ -1,0 +1,279 @@
+```python
+import os
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+import torchvision.transforms as transforms
+from torchvision.datasets import ImageFolder
+
+
+# ---------------------------------------------------------------------------
+# Architecture helpers
+# ---------------------------------------------------------------------------
+
+class _SeparableConv2d(nn.Module):
+    """Depthwise-separable 2-D convolution (matches Keras SeparableConv2D)."""
+
+    def __init__(self, in_channels: int, out_channels: int,
+                 kernel_size: int, padding: int = 0):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size,
+            padding=padding, groups=in_channels, bias=False,
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pointwise(self.depthwise(x))
+
+
+# ---------------------------------------------------------------------------
+# Model  (PyTorch port of Chollet's mini-Xception Cats-vs-Dogs model)
+# ---------------------------------------------------------------------------
+
+class MiniXception(nn.Module):
+    """
+    Minimal Xception variant for binary (or multi-class) image classification.
+
+    Input: float32 tensor in [0, 1] range, shape (B, 3, H, W).
+    The original Keras model rescaled inputs from [0, 255]; here we expect
+    [0, 1] because torchvision ToTensor already applies the /255 step.
+
+    Architecture is a faithful port of make_model() from the original script:
+      Entry block  : Conv2d(128, 3, stride=2) → BN → ReLU
+      Middle blocks: three residual blocks with separable convs (256 / 512 / 728)
+      Top block    : SeparableConv2d(1024, 3) → BN → ReLU → GAP → Dropout → Linear
+    """
+
+    def __init__(self, num_classes: int = 2,
+                 image_size: tuple = (180, 180)):   # kept for config-API compat
+        super().__init__()
+
+        # Entry block
+        self.entry_conv = nn.Conv2d(3, 128, 3, stride=2, padding=1, bias=False)
+        self.entry_bn   = nn.BatchNorm2d(128)
+
+        # Three middle residual blocks  (sizes match original: 256, 512, 728)
+        self.res_blocks = nn.ModuleList()
+        self.res_skips  = nn.ModuleList()
+        prev_ch = 128
+        for size in (256, 512, 728):
+            block = nn.Sequential(
+                nn.ReLU(),
+                _SeparableConv2d(prev_ch, size, 3, padding=1),
+                nn.BatchNorm2d(size),
+                nn.ReLU(),
+                _SeparableConv2d(size, size, 3, padding=1),
+                nn.BatchNorm2d(size),
+                nn.MaxPool2d(3, stride=2, padding=1),   # "same" padding equiv.
+            )
+            self.res_blocks.append(block)
+            # 1×1 projection shortcut (matches Keras Conv2D(size, 1, strides=2))
+            self.res_skips.append(
+                nn.Conv2d(prev_ch, size, 1, stride=2, bias=False)
+            )
+            prev_ch = size
+
+        # Top separable-conv block
+        self.top_sep = _SeparableConv2d(728, 1024, 3, padding=1)
+        self.top_bn  = nn.BatchNorm2d(1024)
+
+        # Classification head
+        self.gap     = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.25)
+        units = 1 if num_classes == 2 else num_classes  # matches original logic
+        self.head    = nn.Linear(1024, units)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Entry block
+        x = F.relu(self.entry_bn(self.entry_conv(x)))
+        prev = x
+
+        # Residual blocks
+        for block, skip in zip(self.res_blocks, self.res_skips):
+            x = block(x) + skip(prev)
+            prev = x
+
+        # Top block
+        x = F.relu(self.top_bn(self.top_sep(x)))
+        x = self.gap(x).flatten(1)
+        x = self.dropout(x)
+        return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# Dataset helper: apply per-split transforms to a random_split Subset
+# ---------------------------------------------------------------------------
+
+class _TransformSubset(Dataset):
+    """
+    Wraps a Subset whose underlying ImageFolder was created with transform=None
+    (i.e. __getitem__ returns raw PIL Images) and applies a split-specific
+    transform on the fly.
+    """
+
+    def __init__(self, subset, transform):
+        self.subset    = subset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        img, label = self.subset[idx]      # img is a PIL Image
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+# ---------------------------------------------------------------------------
+# FL API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Instantiate and return a MiniXception model.
+
+    Constructor arguments are read from config.get('model_kwargs', {}).
+    Recognised keys: num_classes (int, default 2), image_size (tuple, default (180,180)).
+    """
+    kwargs = config.get("model_kwargs", {})
+    return MiniXception(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the Cats-vs-Dogs PetImages dataset.
+
+    Expected on-disk layout
+    -----------------------
+        <data_path>/PetImages/Cat/*.jpg
+        <data_path>/PetImages/Dog/*.jpg
+
+    Config keys consumed
+    --------------------
+        data_path                  (str)   root dir containing PetImages/
+        local.batch_size           (int)   mini-batch size              (default 16)
+        model_kwargs.image_size    (tuple) resize target                (default (180,180))
+        allow_synthetic_data       (bool)  if True AND PetImages/ is absent,
+                                           fall back to random tensors for
+                                           debugging; if False (default) raise
+                                           FileNotFoundError instead.
+
+    Splits
+    ------
+        80 % of images → "train" split (with random-flip + random-rotation augmentation)
+        20 % of images → "val"   split (resize + ToTensor only)
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path  = config.get("data_path", ".")
+    image_size = config.get("model_kwargs", {}).get("image_size", (180, 180))
+
+    pets_path = os.path.join(data_path, "PetImages")
+
+    # ── synthetic fallback (only when explicitly allowed) ─────────────────
+    if not os.path.isdir(pets_path):
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"PetImages dataset directory not found at '{pets_path}'. "
+                "Set config['data_path'] to the directory that contains "
+                "PetImages/Cat/ and PetImages/Dog/, or set "
+                "config['allow_synthetic_data'] = True to use random tensors "
+                "for smoke-testing."
+            )
+        # Random tensors in [0, 1]; labels ∈ {0, 1}
+        n = 200 if split == "train" else 50
+        x = torch.randn(n, 3, *image_size).clamp(0.0, 1.0)
+        y = torch.randint(0, 2, (n,), dtype=torch.long)
+        return DataLoader(
+            TensorDataset(x, y),
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+        )
+
+    # ── real data path ────────────────────────────────────────────────────
+    # Training transform: matches Keras RandomFlip("horizontal") +
+    # RandomRotation(0.1) where 0.1 fraction-of-2π → ±36 degrees.
+    train_transform = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(degrees=36),
+        transforms.ToTensor(),          # PIL [0,255] → float32 [0,1]
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ])
+
+    # Load full dataset with transform=None so __getitem__ returns PIL Images;
+    # split-specific transforms are applied by _TransformSubset after splitting.
+    full_ds = ImageFolder(pets_path, transform=None)
+
+    n_total = len(full_ds)
+    n_val   = max(1, int(round(0.2 * n_total)))
+    n_train = n_total - n_val
+
+    train_sub, val_sub = random_split(
+        full_ds, [n_train, n_val],
+        generator=torch.Generator().manual_seed(1337),
+    )
+
+    if split == "train":
+        ds = _TransformSubset(train_sub, train_transform)
+        return DataLoader(
+            ds, batch_size=batch_size, shuffle=True,
+            num_workers=4, pin_memory=True, drop_last=True,
+        )
+    else:
+        ds = _TransformSubset(val_sub, val_transform)
+        return DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=4, pin_memory=True,
+        )
+
+
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    Execute a single forward pass and return the scalar loss tensor.
+
+    The loss is returned *with its computation graph intact* so that the FL
+    runtime can call loss.backward() and optimizer.step() at the appropriate
+    aggregation point.  Neither backward() nor optimizer.step() are called here.
+
+    Loss function: BCEWithLogitsLoss — equivalent to Keras
+    BinaryCrossentropy(from_logits=True) used in the original script.
+    """
+    device = next(model.parameters()).device
+
+    images, labels = batch
+    images = images.to(device)                        # (B, 3, H, W)  float32
+    labels = labels.to(device, dtype=torch.float32)   # (B,)  values in {0.0, 1.0}
+
+    logits = model(images).squeeze(1)                 # (B,)  raw logits
+
+    loss = F.binary_cross_entropy_with_logits(logits, labels)
+    return loss   # grad attached; FL runtime owns backward() + optimizer.step()
+```
+
+---
+
+### Key design decisions
+
+| Original (Keras / TF) | FL client (PyTorch) | Rationale |
+|---|---|---|
+| `make_model()` Keras functional API | `MiniXception(nn.Module)` | Framework conversion rule |
+| `Rescaling(1/255)` inside model | Removed from model | `ToTensor()` already maps `[0,255]→[0,1]` |
+| `layers.SeparableConv2D` | `_SeparableConv2d` (depthwise + pointwise) | Exact structural match |
+| `keras.utils.image_dataset_from_directory` | `ImageFolder` + `random_split` | Required FL API contract |
+| `RandomRotation(0.1)` (fraction of 2π) | `RandomRotation(degrees=36)` | `0.1 × 360° = ±36°` exact equivalent |
+| `BinaryCrossentropy(from_logits=True)` | `F.binary_cross_entropy_with_logits` | Numerically identical |
+| `model.fit()` handles backward + step | **Not called here** | FL runtime owns that loop |
+| Corrupted-image filter at top-level | Assumed pre-filtered; `FileNotFoundError` if data absent | FL clients should not mutate shared data |

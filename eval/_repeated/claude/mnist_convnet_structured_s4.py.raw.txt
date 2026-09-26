@@ -1,0 +1,169 @@
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import torchvision
+import torchvision.transforms as transforms
+
+
+# ── Model (Keras Sequential → PyTorch nn.Module) ──────────────────────────────
+#
+# Original Keras architecture (preserved exactly):
+#   Conv2D(32, 3×3, relu) → MaxPool(2×2) →
+#   Conv2D(64, 3×3, relu) → MaxPool(2×2) →
+#   Flatten → Dropout(0.5) → Dense(10, softmax)
+#
+# The explicit softmax is replaced by nn.CrossEntropyLoss (which applies
+# log-softmax internally), giving numerically identical behaviour.
+# Feature-map sizes after each block on a 28×28 input:
+#   28 → conv(3) → 26 → maxpool(2) → 13
+#   13 → conv(3) → 11 → maxpool(2) →  5
+#   Flattened: 64 × 5 × 5 = 1 600 units.
+
+class MNISTConvNet(nn.Module):
+    def __init__(self, num_classes: int = 10, dropout: float = 0.5):
+        super().__init__()
+        self.conv1   = nn.Conv2d(1,  32, kernel_size=3)
+        self.pool1   = nn.MaxPool2d(2, 2)
+        self.conv2   = nn.Conv2d(32, 64, kernel_size=3)
+        self.pool2   = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout(p=dropout)
+        self.fc      = nn.Linear(64 * 5 * 5, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool1(F.relu(self.conv1(x)))   # → (B, 32, 13, 13)
+        x = self.pool2(F.relu(self.conv2(x)))   # → (B, 64,  5,  5)
+        x = torch.flatten(x, 1)                 # → (B, 1600)
+        x = self.dropout(x)
+        x = self.fc(x)                          # → (B, 10)  raw logits
+        return x
+
+
+# ── FL interface ──────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """Instantiate and return the MNISTConvNet.
+
+    Recognised config['model_kwargs'] keys
+    ───────────────────────────────────────
+    num_classes : int   (default 10)
+    dropout     : float (default 0.5)
+    """
+    kwargs = config.get("model_kwargs", {})
+    return MNISTConvNet(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split ("train" or "val").
+
+    Config keys read
+    ────────────────
+    config["local"]["batch_size"]   : int   (default 16)
+    config["data_path"]             : str   (default ".")
+    config["val_ratio"]             : float (default 0.1)
+    config["allow_synthetic_data"]  : bool  (default False)
+
+    Real data is loaded from a local MNIST archive (download=False).
+    If the archive is missing and allow_synthetic_data is True, a tiny
+    synthetic dataset is used instead.  If the flag is False (the default),
+    a FileNotFoundError is raised — the caller is never silently trained on
+    synthetic data.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path  = config.get("data_path", ".")
+    val_ratio  = config.get("val_ratio", 0.1)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),                        # uint8 [0,255] → float [0,1]
+        transforms.Normalize((0.1307,), (0.3081,)),   # MNIST channel mean / std
+    ])
+
+    try:
+        full_dataset = torchvision.datasets.MNIST(
+            root=data_path,
+            train=True,
+            download=False,
+            transform=transform,
+        )
+    except Exception as exc:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"MNIST dataset not found at '{data_path}'. "
+                "Either point config['data_path'] to the directory that "
+                "already contains the MNIST files, or set "
+                "config['allow_synthetic_data']=True to use a small "
+                "synthetic dataset for smoke-testing only."
+            ) from exc
+
+        # ── Synthetic fallback (smoke-testing only) ────────────────────────
+        n_syn = 256
+        x_syn = torch.randn(n_syn, 1, 28, 28)
+        y_syn = torch.randint(0, 10, (n_syn,))
+        full_dataset = TensorDataset(x_syn, y_syn)
+
+    n_total = len(full_dataset)
+    n_val   = max(1, int(n_total * val_ratio))
+    n_train = n_total - n_val
+
+    train_subset, val_subset = random_split(
+        full_dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen = train_subset if split == "train" else val_subset
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        drop_last=False,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Run one forward pass and return the scalar loss tensor (grad attached).
+
+    Contract
+    ────────
+    • Does NOT call loss.backward() — the FL runtime handles that.
+    • Does NOT call optimizer.step() — the FL runtime handles that.
+    • Moves all tensors to the device inferred from the model parameters.
+
+    Labels may arrive as either:
+      - long integers  (standard torchvision MNIST)
+      - float one-hot  (custom datasets that mimic the original Keras pipeline)
+    Both forms are handled transparently.
+    """
+    device = next(model.parameters()).device
+
+    images, labels = batch
+    images = images.to(device)
+    labels = labels.to(device)
+
+    # Convert one-hot float labels → integer class indices if necessary.
+    if labels.ndim > 1:
+        labels = labels.argmax(dim=1)
+    labels = labels.long()
+
+    logits = model(images)
+    loss   = F.cross_entropy(logits, labels)
+    return loss  # grad_fn is attached; caller will call .backward()
+```
+
+### Key conversion decisions
+
+| Keras original | PyTorch equivalent | Reason |
+|---|---|---|
+| `keras.datasets.mnist.load_data()` | `torchvision.datasets.MNIST` | Native PyTorch dataset; keeps `DataLoader` / `random_split` support |
+| `activation="softmax"` on the last `Dense` | Logits + `F.cross_entropy` | Numerically stabler; `CrossEntropyLoss` subsumes log-softmax |
+| `loss="categorical_crossentropy"` | `F.cross_entropy(logits, long_labels)` | Direct equivalent for multi-class classification |
+| `model.fit(..., validation_split=0.1)` | `random_split(full_dataset, [n_train, n_val])` | Reproducible 90/10 split via `manual_seed(42)` |
+| `Dropout(0.5)` | `nn.Dropout(p=0.5)` | Identical; PyTorch automatically disables it during `model.eval()` |
+| One-hot `y_train` | Integer class labels | `F.cross_entropy` expects class indices; one-hot guard handles legacy loaders |

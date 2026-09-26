@@ -1,0 +1,227 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: keras_char_seq2seq.py
+
+Exposes:
+  build_model(config)                       -> keras.Model
+  build_dataloader(config, split)           -> Seq2SeqDataLoader
+  train_step(model, batch, opt, config)     -> scalar loss
+"""
+
+import os
+import numpy as np
+import keras
+from pathlib import Path
+
+
+# ── Data helpers ────────────────────────────────────────────────────────
+
+class Seq2SeqCharDataset:
+    """Vectorized character-level seq2seq dataset loaded from a tab-separated text file."""
+
+    def __init__(self, data_path: str, num_samples: int = 10000):
+        input_texts, target_texts = [], []
+        input_characters, target_characters = set(), set()
+
+        with open(data_path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+
+        for line in lines[: min(num_samples, len(lines) - 1)]:
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            input_text, target_text = parts[0], parts[1]
+            target_text = "\t" + target_text + "\n"
+            input_texts.append(input_text)
+            target_texts.append(target_text)
+            for char in input_text:
+                input_characters.add(char)
+            for char in target_text:
+                target_characters.add(char)
+
+        input_characters = sorted(input_characters)
+        target_characters = sorted(target_characters)
+        self.input_token_index = {c: i for i, c in enumerate(input_characters)}
+        self.target_token_index = {c: i for i, c in enumerate(target_characters)}
+        self.num_encoder_tokens = len(input_characters)
+        self.num_decoder_tokens = len(target_characters)
+        self.max_encoder_seq_length = max(len(t) for t in input_texts)
+        self.max_decoder_seq_length = max(len(t) for t in target_texts)
+
+        n = len(input_texts)
+        enc = np.zeros((n, self.max_encoder_seq_length, self.num_encoder_tokens), dtype="float32")
+        dec_in = np.zeros((n, self.max_decoder_seq_length, self.num_decoder_tokens), dtype="float32")
+        dec_tgt = np.zeros((n, self.max_decoder_seq_length, self.num_decoder_tokens), dtype="float32")
+
+        for i, (inp, tgt) in enumerate(zip(input_texts, target_texts)):
+            for t, char in enumerate(inp):
+                enc[i, t, self.input_token_index[char]] = 1.0
+            enc[i, t + 1:, self.input_token_index[" "]] = 1.0
+            for t, char in enumerate(tgt):
+                dec_in[i, t, self.target_token_index[char]] = 1.0
+                if t > 0:
+                    dec_tgt[i, t - 1, self.target_token_index[char]] = 1.0
+            dec_in[i, t + 1:, self.target_token_index[" "]] = 1.0
+            dec_tgt[i, t:, self.target_token_index[" "]] = 1.0
+
+        self.encoder_input_data = enc
+        self.decoder_input_data = dec_in
+        self.decoder_target_data = dec_tgt
+
+    def __len__(self):
+        return len(self.encoder_input_data)
+
+
+class Seq2SeqDataLoader:
+    """Iterable yielding (encoder_input, decoder_input, decoder_target) numpy batches."""
+
+    def __init__(
+        self,
+        dataset: Seq2SeqCharDataset,
+        indices: np.ndarray,
+        batch_size: int,
+        shuffle: bool,
+    ):
+        self.enc = dataset.encoder_input_data[indices]
+        self.dec_in = dataset.decoder_input_data[indices]
+        self.dec_tgt = dataset.decoder_target_data[indices]
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n = len(indices)
+
+    def __len__(self):
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        order = np.random.permutation(self.n) if self.shuffle else np.arange(self.n)
+        for start in range(0, self.n, self.batch_size):
+            idx = order[start : start + self.batch_size]
+            yield self.enc[idx], self.dec_in[idx], self.dec_tgt[idx]
+
+
+def _maybe_download(config: dict) -> str:
+    """Return a local path to fra.txt, downloading if needed."""
+    data_path = config.get("data_path", None)
+    if data_path and os.path.isfile(data_path):
+        return data_path
+    fpath = keras.utils.get_file(origin="http://www.manythings.org/anki/fra-eng.zip")
+    dirpath = Path(fpath).parent.absolute()
+    os.system(f"unzip -q {fpath} -d {dirpath}")
+    return str(os.path.join(dirpath, "fra.txt"))
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    """Instantiate the seq2seq training model. Reads vocab sizes from config['num_encoder_tokens']
+    and config['num_decoder_tokens'] (populated as a side effect of build_dataloader)."""
+    latent_dim = config.get("latent_dim", 256)
+    num_encoder_tokens = config["num_encoder_tokens"]
+    num_decoder_tokens = config["num_decoder_tokens"]
+
+    encoder_inputs = keras.Input(shape=(None, num_encoder_tokens))
+    encoder = keras.layers.LSTM(latent_dim, return_state=True)
+    _, state_h, state_c = encoder(encoder_inputs)
+    encoder_states = [state_h, state_c]
+
+    decoder_inputs = keras.Input(shape=(None, num_decoder_tokens))
+    decoder_lstm = keras.layers.LSTM(latent_dim, return_sequences=True, return_state=True)
+    decoder_outputs, _, _ = decoder_lstm(decoder_inputs, initial_state=encoder_states)
+    decoder_dense = keras.layers.Dense(num_decoder_tokens, activation="softmax")
+    decoder_outputs = decoder_dense(decoder_outputs)
+
+    return keras.Model([encoder_inputs, decoder_inputs], decoder_outputs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> Seq2SeqDataLoader:
+    """
+    Build a Seq2SeqDataLoader for the requested split.
+    Expects config to have 'data_path' (optional — will auto-download if absent).
+    Reads 'num_samples', 'val_ratio', 'seed', and client-local 'batch_size' from config.
+    Populates config['num_encoder_tokens'] and config['num_decoder_tokens'] as a side effect
+    so that build_model can be called after this without extra arguments.
+    """
+    local = config.get("local", {})
+    batch_size = local.get("batch_size", config.get("batch_size", 64))
+    num_samples = config.get("num_samples", 10000)
+    val_ratio = config.get("val_ratio", 0.2)
+    seed = config.get("seed", 42)
+
+    data_path = _maybe_download(config)
+    dataset = Seq2SeqCharDataset(data_path=data_path, num_samples=num_samples)
+
+    config["num_encoder_tokens"] = dataset.num_encoder_tokens
+    config["num_decoder_tokens"] = dataset.num_decoder_tokens
+
+    n = len(dataset)
+    n_val = max(1, int(n * val_ratio))
+    n_train = n - n_val
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    train_idx, val_idx = perm[:n_train], perm[n_train:]
+
+    indices = train_idx if split == "train" else val_idx
+    return Seq2SeqDataLoader(
+        dataset, indices, batch_size=batch_size, shuffle=(split == "train")
+    )
+
+
+def train_step(
+    model: keras.Model,
+    batch,
+    optimizer,
+    config: dict,
+):
+    """
+    Perform one forward (+ optionally backward) step.
+    batch: (encoder_input, decoder_input, decoder_target) numpy arrays or tensors.
+    If optimizer is None (preflight forward-only check), skip backward.
+    Dispatches on the active Keras backend; lazy-imports backend libs to avoid
+    hard import-time dependencies.
+    """
+    if isinstance(batch, (list, tuple)):
+        enc_in, dec_in, dec_tgt = batch[0], batch[1], batch[2]
+    elif isinstance(batch, dict):
+        enc_in = batch.get("encoder_input", batch.get("x_enc"))
+        dec_in = batch.get("decoder_input", batch.get("x_dec"))
+        dec_tgt = batch.get("decoder_target", batch.get("y"))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    backend = keras.backend.backend()
+
+    if backend == "tensorflow":
+        import tensorflow as tf  # safe: TF must be installed when backend == "tensorflow"
+        with tf.GradientTape() as tape:
+            outputs = model([enc_in, dec_in], training=(optimizer is not None))
+            loss = keras.ops.mean(
+                keras.losses.categorical_crossentropy(dec_tgt, outputs)
+            )
+        if optimizer is not None:
+            grads = tape.gradient(loss, model.trainable_variables)
+            if hasattr(optimizer, "apply_gradients"):
+                optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            else:
+                optimizer.apply(grads, model.trainable_variables)
+        return loss
+
+    # ── JAX / PyTorch / other backends ──────────────────────────────────
+    # Forward-only (preflight or eval): avoid requiring a compiled model.
+    if optimizer is None:
+        outputs = model([enc_in, dec_in], training=False)
+        loss = keras.ops.mean(
+            keras.losses.categorical_crossentropy(dec_tgt, outputs)
+        )
+        return np.float32(float(keras.ops.convert_to_numpy(loss)))
+
+    # Training pass: compile model once with the provided optimizer and delegate
+    # to Keras's built-in backend-agnostic training step.
+    if not getattr(model, "_fl_compiled", False):
+        model.compile(optimizer=optimizer, loss="categorical_crossentropy")
+        model._fl_compiled = True
+
+    result = model.train_on_batch([enc_in, dec_in], dec_tgt)
+    loss_val = result[0] if isinstance(result, (list, tuple)) else result
+    return np.float32(float(loss_val))
+```

@@ -1,0 +1,126 @@
+"""
+Auto-generated FL client module.
+Original script: lightgbm regression example
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+
+
+class TabularRegressionDataset(Dataset):
+    """Load tab-separated regression data (LightGBM example format)."""
+
+    def __init__(self, data_path: str = ".", is_train: bool = True, feature_dim: int = 28):
+        split_file = "regression.train" if is_train else "regression.test"
+        csv_path = f"{data_path}/{split_file}"
+        try:
+            df = pd.read_csv(csv_path, header=None, sep="\t")
+            self.targets = torch.tensor(df[0].values, dtype=torch.float32)
+            self.features = torch.tensor(df.drop(0, axis=1).values.astype(np.float32))
+        except FileNotFoundError:
+            # synthetic fallback for testing
+            n = 200
+            self.features = torch.randn(n, feature_dim)
+            self.targets = torch.randn(n)
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.targets[idx]
+
+
+class MLPRegressor(nn.Module):
+    def __init__(self, input_dim: int = 28, hidden_dims: tuple = (64, 32), dropout: float = 0.1):
+        super().__init__()
+        layers = []
+        in_dim = input_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)]
+            in_dim = h
+        layers.append(nn.Linear(in_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return MLPRegressor(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 32))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", ".")
+    dataset_kwargs = config.get("dataset_kwargs", {})
+
+    if split == "test":
+        ds = TabularRegressionDataset(data_path=data_path, is_train=False, **dataset_kwargs)
+    else:
+        full_ds = TabularRegressionDataset(data_path=data_path, is_train=True, **dataset_kwargs)
+        val_ratio = config.get("val_ratio", 0.1)
+        n_val = max(1, int(len(full_ds) * val_ratio))
+        n_train = len(full_ds) - n_val
+        train_ds, val_ds = random_split(
+            full_ds, [n_train, n_val],
+            generator=torch.Generator().manual_seed(config.get("seed", 42)),
+        )
+        ds = train_ds if split == "train" else val_ds
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("features")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    loss = nn.MSELoss()(outputs, targets.float())
+    return loss

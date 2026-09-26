@@ -1,0 +1,141 @@
+"""
+Auto-generated FL client module.
+Original script: MONAI 3-D UNet segmentation training (sliding-window, DiceLoss).
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+from glob import glob
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+import monai
+from monai.data import list_data_collate
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirstd,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+
+
+# ── Dataset helpers ─────────────────────────────────────────────────────
+
+def _build_file_list(data_path: str):
+    """Return (train_files, val_files) dicts from a directory of img/seg NIfTI pairs."""
+    images = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+    segs   = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+    pairs  = [{"img": img, "seg": seg} for img, seg in zip(images, segs)]
+    if not pairs:
+        raise FileNotFoundError(f"No img*/seg* NIfTI pairs found under {data_path!r}")
+    split_idx = max(1, int(len(pairs) * 0.8))
+    return pairs[:split_idx], pairs[split_idx:]
+
+
+def _train_transforms(spatial_size=(96, 96, 96)):
+    return Compose([
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        ScaleIntensityd(keys="img"),
+        RandCropByPosNegLabeld(
+            keys=["img", "seg"],
+            label_key="seg",
+            spatial_size=list(spatial_size),
+            pos=1, neg=1, num_samples=4,
+        ),
+        RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+    ])
+
+
+def _val_transforms():
+    return Compose([
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        ScaleIntensityd(keys="img"),
+    ])
+
+
+# ── FL Interface ─────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return monai.networks.nets.UNet(
+        spatial_dims=kwargs.get("spatial_dims", 3),
+        in_channels=kwargs.get("in_channels", 1),
+        out_channels=kwargs.get("out_channels", 1),
+        channels=tuple(kwargs.get("channels", (16, 32, 64, 128, 256))),
+        strides=tuple(kwargs.get("strides", (2, 2, 2, 2))),
+        num_res_units=kwargs.get("num_res_units", 2),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 2))
+    num_workers = local.get("num_workers", config.get("num_workers", 4))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path   = config.get("data_path", ".")
+    spatial_size = tuple(config.get("spatial_size", [96, 96, 96]))
+
+    train_files, val_files = _build_file_list(data_path)
+
+    if split == "train":
+        ds = monai.data.Dataset(data=train_files, transform=_train_transforms(spatial_size))
+        shuffle = True
+    else:
+        ds = monai.data.Dataset(data=val_files, transform=_val_transforms())
+        batch_size = 1
+        shuffle = False
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=list_data_collate,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list | dict,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, dict):
+        inputs  = batch["img"].to(device)
+        targets = batch["seg"].to(device)
+    elif isinstance(batch, (list, tuple)):
+        inputs  = batch[0].to(device)
+        targets = batch[1].to(device)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    criterion = monai.losses.DiceLoss(sigmoid=True)
+    loss = criterion(outputs, targets)
+    return loss

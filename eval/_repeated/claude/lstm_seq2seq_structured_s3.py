@@ -1,0 +1,238 @@
+import numpy as np
+import os
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+# ---------------------------------------------------------------------------
+# Fallback vocabulary / sequence-length constants
+# (used only when synthetic data is requested and no real file is present)
+# ---------------------------------------------------------------------------
+_DEFAULT_NUM_ENCODER_TOKENS = 71
+_DEFAULT_NUM_DECODER_TOKENS = 93
+_DEFAULT_MAX_ENCODER_SEQ_LEN = 16
+_DEFAULT_MAX_DECODER_SEQ_LEN = 59
+
+
+# ---------------------------------------------------------------------------
+# Model – exact PyTorch equivalent of the original Keras seq2seq architecture
+# ---------------------------------------------------------------------------
+class Seq2SeqModel(nn.Module):
+    """Character-level seq2seq: encoder LSTM → decoder LSTM → linear softmax."""
+
+    def __init__(
+        self,
+        num_encoder_tokens: int,
+        num_decoder_tokens: int,
+        latent_dim: int = 256,
+    ):
+        super().__init__()
+        self.encoder_lstm = nn.LSTM(
+            input_size=num_encoder_tokens,
+            hidden_size=latent_dim,
+            batch_first=True,
+        )
+        self.decoder_lstm = nn.LSTM(
+            input_size=num_decoder_tokens,
+            hidden_size=latent_dim,
+            batch_first=True,
+        )
+        self.decoder_dense = nn.Linear(latent_dim, num_decoder_tokens)
+
+    def forward(
+        self,
+        encoder_input: torch.Tensor,
+        decoder_input: torch.Tensor,
+    ) -> torch.Tensor:
+        # Encoder: discard outputs, keep final (h, c) states
+        _, (state_h, state_c) = self.encoder_lstm(encoder_input)
+        # Decoder: use encoder states as initial state; return full sequence
+        decoder_output, _ = self.decoder_lstm(
+            decoder_input, (state_h, state_c)
+        )
+        # Project to vocabulary size and apply softmax
+        logits = self.decoder_dense(decoder_output)          # (B, T, V_dec)
+        return F.softmax(logits, dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# FL interface – 1: build_model
+# ---------------------------------------------------------------------------
+def build_model(config: dict) -> nn.Module:
+    """Instantiate and return Seq2SeqModel from config."""
+    kwargs = config.get("model_kwargs", {})
+    num_encoder_tokens = kwargs.get("num_encoder_tokens", _DEFAULT_NUM_ENCODER_TOKENS)
+    num_decoder_tokens = kwargs.get("num_decoder_tokens", _DEFAULT_NUM_DECODER_TOKENS)
+    latent_dim = kwargs.get("latent_dim", 256)
+    return Seq2SeqModel(num_encoder_tokens, num_decoder_tokens, latent_dim)
+
+
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
+def _parse_fra_txt(fra_file: str, num_samples: int = 10000):
+    """Replicate the original vectorisation logic; return three numpy arrays."""
+    input_texts = []
+    target_texts = []
+    input_characters: set = set()
+    target_characters: set = set()
+
+    with open(fra_file, "r", encoding="utf-8") as f:
+        lines = f.read().split("\n")
+
+    for line in lines[: min(num_samples, len(lines) - 1)]:
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        input_text, target_text = parts[0], parts[1]
+        target_text = "\t" + target_text + "\n"
+        input_texts.append(input_text)
+        target_texts.append(target_text)
+        for char in input_text:
+            input_characters.add(char)
+        for char in target_text:
+            target_characters.add(char)
+
+    input_characters_sorted = sorted(list(input_characters))
+    target_characters_sorted = sorted(list(target_characters))
+    num_encoder_tokens = len(input_characters_sorted)
+    num_decoder_tokens = len(target_characters_sorted)
+    max_encoder_seq_length = max(len(t) for t in input_texts)
+    max_decoder_seq_length = max(len(t) for t in target_texts)
+
+    input_token_index = {
+        char: i for i, char in enumerate(input_characters_sorted)
+    }
+    target_token_index = {
+        char: i for i, char in enumerate(target_characters_sorted)
+    }
+
+    n = len(input_texts)
+    encoder_input_data = np.zeros(
+        (n, max_encoder_seq_length, num_encoder_tokens), dtype="float32"
+    )
+    decoder_input_data = np.zeros(
+        (n, max_decoder_seq_length, num_decoder_tokens), dtype="float32"
+    )
+    decoder_target_data = np.zeros(
+        (n, max_decoder_seq_length, num_decoder_tokens), dtype="float32"
+    )
+
+    space_enc_idx = input_token_index.get(" ", 0)
+    space_dec_idx = target_token_index.get(" ", 0)
+
+    for i, (input_text, target_text) in enumerate(zip(input_texts, target_texts)):
+        t = 0
+        for t, char in enumerate(input_text):
+            encoder_input_data[i, t, input_token_index[char]] = 1.0
+        encoder_input_data[i, t + 1 :, space_enc_idx] = 1.0
+
+        for t, char in enumerate(target_text):
+            decoder_input_data[i, t, target_token_index[char]] = 1.0
+            if t > 0:
+                decoder_target_data[i, t - 1, target_token_index[char]] = 1.0
+        decoder_input_data[i, t + 1 :, space_dec_idx] = 1.0
+        decoder_target_data[i, t:, space_dec_idx] = 1.0
+
+    return encoder_input_data, decoder_input_data, decoder_target_data
+
+
+# ---------------------------------------------------------------------------
+# FL interface – 2: build_dataloader
+# ---------------------------------------------------------------------------
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ('train' or 'val').
+
+    Expected layout under config['data_path']:
+        <data_path>/fra.txt
+
+    Each batch is a tuple of three tensors:
+        encoder_input  – (B, max_enc_len, num_encoder_tokens)  float32
+        decoder_input  – (B, max_dec_len, num_decoder_tokens)  float32
+        decoder_target – (B, max_dec_len, num_decoder_tokens)  float32  one-hot
+    """
+    batch_size: int = config.get("local", {}).get("batch_size", 16)
+    data_path: str = config.get("data_path", ".")
+    num_samples: int = config.get("num_samples", 10000)
+
+    fra_file = os.path.join(data_path, "fra.txt")
+
+    if os.path.isfile(fra_file):
+        enc_np, dec_in_np, dec_tgt_np = _parse_fra_txt(fra_file, num_samples)
+        enc_t = torch.from_numpy(enc_np)
+        dec_in_t = torch.from_numpy(dec_in_np)
+        dec_tgt_t = torch.from_numpy(dec_tgt_np)
+        dataset = TensorDataset(enc_t, dec_in_t, dec_tgt_t)
+    else:
+        # ----------------------------------------------------------------
+        # Real data unavailable – check flag before falling back
+        # ----------------------------------------------------------------
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Dataset file not found: '{fra_file}'. "
+                "Provide the correct 'data_path' in config, or set "
+                "config['allow_synthetic_data'] = True to use synthetic data."
+            )
+
+        # Synthetic fallback (gated above)
+        mkw = config.get("model_kwargs", {})
+        num_enc_tok = mkw.get("num_encoder_tokens", _DEFAULT_NUM_ENCODER_TOKENS)
+        num_dec_tok = mkw.get("num_decoder_tokens", _DEFAULT_NUM_DECODER_TOKENS)
+        max_enc_len = _DEFAULT_MAX_ENCODER_SEQ_LEN
+        max_dec_len = _DEFAULT_MAX_DECODER_SEQ_LEN
+        n = num_samples
+
+        enc_t = torch.randn(n, max_enc_len, num_enc_tok)
+        dec_in_t = torch.randn(n, max_dec_len, num_dec_tok)
+        tgt_idx = torch.randint(0, num_dec_tok, (n, max_dec_len))
+        dec_tgt_t = F.one_hot(tgt_idx, num_classes=num_dec_tok).float()
+        dataset = TensorDataset(enc_t, dec_in_t, dec_tgt_t)
+
+    # ----------------------------------------------------------------
+    # Train / val split (80 / 20 – mirrors the original validation_split=0.2)
+    # ----------------------------------------------------------------
+    total = len(dataset)
+    val_size = max(1, int(0.2 * total))
+    train_size = total - val_size
+    train_ds, val_ds = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen = train_ds if split == "train" else val_ds
+    return DataLoader(chosen, batch_size=batch_size, shuffle=(split == "train"))
+
+
+# ---------------------------------------------------------------------------
+# FL interface – 3: train_step
+# ---------------------------------------------------------------------------
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer,           # noqa: F841 – provided by FL runtime, not used here
+    config: dict,
+) -> torch.Tensor:
+    """
+    One forward pass.  Returns loss WITH grad attached.
+    backward() and optimizer.step() are intentionally NOT called here;
+    the FL runtime is responsible for both.
+    """
+    device = next(model.parameters()).device
+
+    encoder_input, decoder_input, decoder_target = batch
+    encoder_input = encoder_input.to(device)
+    decoder_input = decoder_input.to(device)
+    decoder_target = decoder_target.to(device)
+
+    # Forward
+    output = model(encoder_input, decoder_input)   # (B, T, num_decoder_tokens)
+
+    # Categorical cross-entropy matching Keras 'categorical_crossentropy':
+    #   loss = -sum_over_classes( target * log(prob) )  averaged over B and T
+    loss = -(decoder_target * torch.log(output + 1e-8)).sum(dim=-1).mean()
+    return loss

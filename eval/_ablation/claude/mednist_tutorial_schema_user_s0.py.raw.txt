@@ -1,0 +1,128 @@
+```python
+import logging
+import os
+import sys
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.tensorboard import SummaryWriter
+
+import monai
+from monai.data import ImageDataset
+from monai.transforms import EnsureChannelFirst, Compose, RandRotate90, Resize, ScaleIntensity
+
+
+_IXI_IMAGES = [
+    "IXI314-IOP-0889-T1.nii.gz",
+    "IXI249-Guys-1072-T1.nii.gz",
+    "IXI609-HH-2600-T1.nii.gz",
+    "IXI173-HH-1590-T1.nii.gz",
+    "IXI020-Guys-0700-T1.nii.gz",
+    "IXI342-Guys-0909-T1.nii.gz",
+    "IXI134-Guys-0780-T1.nii.gz",
+    "IXI577-HH-2661-T1.nii.gz",
+    "IXI066-Guys-0731-T1.nii.gz",
+    "IXI130-HH-1528-T1.nii.gz",
+    "IXI607-Guys-1097-T1.nii.gz",
+    "IXI175-HH-1570-T1.nii.gz",
+    "IXI385-HH-2078-T1.nii.gz",
+    "IXI344-Guys-0905-T1.nii.gz",
+    "IXI409-Guys-0960-T1.nii.gz",
+    "IXI584-Guys-1129-T1.nii.gz",
+    "IXI253-HH-1694-T1.nii.gz",
+    "IXI092-HH-1436-T1.nii.gz",
+    "IXI574-IOP-1156-T1.nii.gz",
+    "IXI585-Guys-1130-T1.nii.gz",
+]
+
+_IXI_LABELS = np.array(
+    [0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0], dtype=np.int64
+)
+
+_TRAIN_TRANSFORMS = Compose(
+    [ScaleIntensity(), EnsureChannelFirst(), Resize((96, 96, 96)), RandRotate90()]
+)
+_VAL_TRANSFORMS = Compose(
+    [ScaleIntensity(), EnsureChannelFirst(), Resize((96, 96, 96))]
+)
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    kwargs = {"spatial_dims": 3, "in_channels": 1, "out_channels": 2}
+    kwargs.update(config.get("model_kwargs", {}))
+    return monai.networks.nets.DenseNet121(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+
+    image_paths = [os.path.join(data_path, f) for f in _IXI_IMAGES]
+    available_mask = np.array([os.path.isfile(p) for p in image_paths])
+    available_images = [p for p, ok in zip(image_paths, available_mask) if ok]
+    available_labels = _IXI_LABELS[available_mask]
+
+    if len(available_images) == 0:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"No IXI-T1 NIfTI files found under '{data_path}'. "
+                "Set config['allow_synthetic_data'] = True to use synthetic data."
+            )
+        n = 20
+        synth_images = torch.randn(n, 1, 96, 96, 96)
+        synth_labels = torch.randint(0, 2, (n,), dtype=torch.long)
+        full_ds = TensorDataset(synth_images, synth_labels)
+        train_size = int(0.8 * n)
+        val_size = n - train_size
+        train_ds, val_ds = random_split(full_ds, [train_size, val_size])
+        chosen = train_ds if split == "train" else val_ds
+        return DataLoader(
+            chosen,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+            num_workers=2,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+    full_ds = ImageDataset(
+        image_files=available_images,
+        labels=available_labels,
+        transform=_TRAIN_TRANSFORMS,
+    )
+    train_size = int(0.8 * len(full_ds))
+    val_size = len(full_ds) - train_size
+    train_subset, val_subset = random_split(full_ds, [train_size, val_size])
+
+    if split == "val":
+        val_indices = list(val_subset.indices)
+        val_images = [available_images[i] for i in val_indices]
+        val_labels = available_labels[val_indices]
+        chosen = ImageDataset(
+            image_files=val_images,
+            labels=val_labels,
+            transform=_VAL_TRANSFORMS,
+        )
+        shuffle = False
+    else:
+        chosen = train_subset
+        shuffle = True
+
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def train_step(model, batch, optimizer, config: dict) -> torch.Tensor:
+    device = next(model.parameters()).device
+    inputs = batch[0].to(device)
+    labels = batch[1].to(device)
+    optimizer.zero_grad()
+    outputs = model(inputs)
+    loss = torch.nn.CrossEntropyLoss()(outputs, labels)
+    return loss
+```

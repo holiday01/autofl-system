@@ -1,0 +1,60 @@
+cff-version: 1.2.0
+message: >-
+  If you use AutoFL in your research, please cite both the paper and this
+  software artifact.
+title: "AutoFL: System and Benchmark Suite"
+type: software
+authors:
+  - family-names: Chiu
+    given-names: Yen-Jung
+    affiliation: "Department of Biomedical Engineering, Chang Gung University, Taoyuan, Taiwan"
+    orcid: "https://orcid.org/0000-0002-2087-2266"
+  - family-names: Chuang
+    given-names: Chao-Chun
+    affiliation: "National Center for High-performance Computing, National Applied Research Laboratories, Taiwan"
+    orcid: "https://orcid.org/0000-0003-2488-0578"
+abstract: >-
+  AutoFL converts existing machine-learning training scripts into
+  federated-learning (FL) client modules. This artifact contains the AutoFL
+  source code (AST rewriter, LLM-based converter, five-stage preflight
+  validator, sample-weighted FedAvg runtime), five conversion strategies
+  (AST rewriting, a rule-based template converter, and zero-shot, few-shot,
+  and schema-augmented LLM prompting), the 13-script benchmark suite spanning
+  PyTorch, TensorFlow, PyTorch Lightning, MONAI, scikit-learn, and XGBoost,
+  a frozen 33-script expansion benchmark, and the generated client files of
+  every experiment.
+keywords:
+  - federated learning
+  - prompt engineering
+  - large language models
+  - code generation
+  - FedAvg
+  - benchmark
+license: MIT
+version: 2.0.0
+date-released: "2026-09-22"
+doi: "10.5281/zenodo.20156961"
+repository-code: "https://github.com/holiday01/autofl-system"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.20156961"
+    description: Concept DOI (latest version)
+  - type: doi
+    value: "10.5281/zenodo.20156962"
+    description: Version 1.0 (as submitted 2026-05-14)
+preferred-citation:
+  type: article
+  title: >-
+    Schema-Augmented LLM Prompting for Converting ML Training Scripts to Federated Learning Clients
+  authors:
+    - family-names: Chiu
+      given-names: Yen-Jung
+      affiliation: "Department of Biomedical Engineering, Chang Gung University, Taoyuan, Taiwan"
+      orcid: "https://orcid.org/0000-0002-2087-2266"
+    - family-names: Chuang
+      given-names: Chao-Chun
+      affiliation: "National Center for High-performance Computing, National Applied Research Laboratories, Taiwan"
+      orcid: "https://orcid.org/0000-0003-2488-0578"
+  journal: "ACM Transactions on Software Engineering and Methodology"
+  year: 2026
+  notes: "Resubmission under review"

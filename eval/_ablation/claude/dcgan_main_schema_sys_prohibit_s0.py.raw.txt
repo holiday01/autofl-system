@@ -1,0 +1,347 @@
+```python
+from __future__ import print_function
+import os
+import random
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+from torch.utils.data import DataLoader, random_split, TensorDataset
+
+
+# ---------------------------------------------------------------------------
+# Weight initialisation (preserved from original)
+# ---------------------------------------------------------------------------
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        torch.nn.init.normal_(m.weight, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        torch.nn.init.normal_(m.weight, 1.0, 0.02)
+        torch.nn.init.zeros_(m.bias)
+
+
+# ---------------------------------------------------------------------------
+# Model architecture (preserved exactly; global nz/ngf/ndf/nc replaced with
+# explicit constructor args so the classes are self-contained)
+# ---------------------------------------------------------------------------
+
+class Generator(nn.Module):
+    def __init__(self, ngpu, nz, ngf, nc):
+        super(Generator, self).__init__()
+        self.ngpu = ngpu
+        self.main = nn.Sequential(
+            # input is Z, going into a convolution
+            nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            # state size. (ngf*8) x 4 x 4
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            # state size. (ngf*4) x 8 x 8
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+            # state size. (ngf*2) x 16 x 16
+            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            # state size. (ngf) x 32 x 32
+            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            nn.Tanh()
+            # state size. (nc) x 64 x 64
+        )
+
+    def forward(self, input):
+        if (input.is_cuda or input.is_xpu) and self.ngpu > 1:
+            output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
+        else:
+            output = self.main(input)
+        return output
+
+
+class Discriminator(nn.Module):
+    def __init__(self, ngpu, nc, ndf):
+        super(Discriminator, self).__init__()
+        self.ngpu = ngpu
+        self.main = nn.Sequential(
+            # input is (nc) x 64 x 64
+            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf) x 32 x 32
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*2) x 16 x 16
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*4) x 8 x 8
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*8) x 4 x 4
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, input):
+        if (input.is_cuda or input.is_xpu) and self.ngpu > 1:
+            output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
+        else:
+            output = self.main(input)
+        return output.view(-1, 1).squeeze(1)
+
+
+# ---------------------------------------------------------------------------
+# GANModel: thin nn.Module wrapper that holds netG and netD so the FL
+# runtime can treat the whole GAN as a single federated model.
+# ---------------------------------------------------------------------------
+
+class GANModel(nn.Module):
+    """Wraps Generator + Discriminator into one nn.Module for FL federation."""
+
+    def __init__(self, ngpu: int, nz: int, ngf: int, ndf: int, nc: int):
+        super(GANModel, self).__init__()
+        self.nz = nz
+        self.netG = Generator(ngpu=ngpu, nz=nz, ngf=ngf, nc=nc)
+        self.netD = Discriminator(ngpu=ngpu, nc=nc, ndf=ndf)
+        self.netG.apply(weights_init)
+        self.netD.apply(weights_init)
+
+    def forward(self, x):
+        # Default forward: discriminate a real/fake image tensor.
+        return self.netD(x)
+
+
+# ---------------------------------------------------------------------------
+# FL interface
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate and return the GANModel.
+
+    Expected config keys (all under 'model_kwargs'):
+        ngpu  (int, default 1)
+        nz    (int, default 100)  – latent vector size
+        ngf   (int, default 64)   – generator feature maps
+        ndf   (int, default 64)   – discriminator feature maps
+        nc    (int, default 3)    – image channels
+    """
+    kwargs = config.get("model_kwargs", {})
+    model = GANModel(
+        ngpu=kwargs.get("ngpu", 1),
+        nz=kwargs.get("nz", 100),
+        ngf=kwargs.get("ngf", 64),
+        ndf=kwargs.get("ndf", 64),
+        nc=kwargs.get("nc", 3),
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split.
+
+    Config keys:
+        data_path               (str,   default ".")
+        dataset                 (str,   default "cifar10")
+            one of: cifar10 | mnist | lsun | imagenet | folder | lfw
+        classes                 (str,   default "bedroom") – LSUN classes
+        local.batch_size        (int,   default 16)
+        model_kwargs.nc         (int,   default 3)
+        model_kwargs.imageSize  (int,   default 64)
+        val_fraction            (float, default 0.1)
+        allow_synthetic_data    (bool,  default False)
+    """
+    local_cfg   = config.get("local", {})
+    batch_size  = local_cfg.get("batch_size", 16)
+    data_path   = config.get("data_path", ".")
+    dataset_name = config.get("dataset", "cifar10").lower()
+    mk          = config.get("model_kwargs", {})
+    image_size  = mk.get("imageSize", 64)
+    nc          = mk.get("nc", 3)
+    val_fraction = float(config.get("val_fraction", 0.1))
+
+    dataset = None
+    load_error = None
+
+    try:
+        norm3 = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        norm1 = transforms.Normalize((0.5,), (0.5,))
+
+        if dataset_name in ('imagenet', 'folder', 'lfw'):
+            if not os.path.isdir(data_path):
+                raise FileNotFoundError(
+                    f"data_path '{data_path}' does not exist or is not a directory."
+                )
+            dataset = dset.ImageFolder(
+                root=data_path,
+                transform=transforms.Compose([
+                    transforms.Resize(image_size),
+                    transforms.CenterCrop(image_size),
+                    transforms.ToTensor(),
+                    norm3,
+                ]),
+            )
+
+        elif dataset_name == 'lsun':
+            classes = [c + '_train' for c in config.get("classes", "bedroom").split(',')]
+            dataset = dset.LSUN(
+                root=data_path,
+                classes=classes,
+                transform=transforms.Compose([
+                    transforms.Resize(image_size),
+                    transforms.CenterCrop(image_size),
+                    transforms.ToTensor(),
+                    norm3,
+                ]),
+            )
+
+        elif dataset_name == 'cifar10':
+            dataset = dset.CIFAR10(
+                root=data_path,
+                download=True,
+                transform=transforms.Compose([
+                    transforms.Resize(image_size),
+                    transforms.ToTensor(),
+                    norm3,
+                ]),
+            )
+
+        elif dataset_name == 'mnist':
+            dataset = dset.MNIST(
+                root=data_path,
+                download=True,
+                transform=transforms.Compose([
+                    transforms.Resize(image_size),
+                    transforms.ToTensor(),
+                    norm1,
+                ]),
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported dataset '{dataset_name}'. "
+                "Choose one of: cifar10, mnist, lsun, imagenet, folder, lfw."
+            )
+
+    except Exception as exc:
+        load_error = exc
+
+    if load_error is not None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Failed to load dataset '{dataset_name}' from '{data_path}'. "
+                "Set config['allow_synthetic_data'] = True to fall back to "
+                f"synthetic data for smoke-testing. Original error: {load_error}"
+            ) from load_error
+
+        # Synthetic fallback – only reached when allow_synthetic_data is True.
+        n_samples = max(batch_size * 10, 200)
+        synthetic_images = torch.randn(n_samples, nc, image_size, image_size)
+        synthetic_labels = torch.zeros(n_samples, dtype=torch.long)
+        dataset = TensorDataset(synthetic_images, synthetic_labels)
+
+    # Split into train / val subsets.
+    total     = len(dataset)
+    val_size  = max(1, int(total * val_fraction))
+    train_size = total - val_size
+    train_subset, val_subset = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen   = train_subset if split == "train" else val_subset
+    shuffle  = (split == "train")
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=2,
+        drop_last=True,
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """One forward pass for a GAN batch.
+
+    Computes a combined loss:
+        L = errD_real + errD_fake + errG
+
+    where:
+      - errD_real : BCE( D(x_real), 1 )
+      - errD_fake : BCE( D(G(z).detach()), 0 )   – no G gradient for D
+      - errG      : BCE( D(G(z)), 1 )             – G gradient intact
+
+    The FL runtime is responsible for calling loss.backward() and
+    optimizer.step(); neither is called here.
+    """
+    device = next(model.parameters()).device
+    nz = config.get("model_kwargs", {}).get("nz", 100)
+
+    real_images = batch[0].to(device)
+    batch_size  = real_images.size(0)
+
+    criterion  = nn.BCELoss()
+    real_label = 1.0
+    fake_label = 0.0
+
+    # ---- Discriminator: real images ----------------------------------------
+    label_real  = torch.full((batch_size,), real_label,
+                             dtype=real_images.dtype, device=device)
+    output_real = model.netD(real_images)
+    errD_real   = criterion(output_real, label_real)
+
+    # ---- Discriminator: fake images (detach G so D and G grads don't mix) ---
+    noise       = torch.randn(batch_size, nz, 1, 1, device=device)
+    fake        = model.netG(noise)                    # keep for G loss below
+    label_fake  = torch.full((batch_size,), fake_label,
+                             dtype=real_images.dtype, device=device)
+    output_fake = model.netD(fake.detach())            # stop G gradient here
+    errD_fake   = criterion(output_fake, label_fake)
+
+    # ---- Generator: fool discriminator (fake labelled as real) --------------
+    label_gen   = torch.full((batch_size,), real_label,
+                             dtype=real_images.dtype, device=device)
+    output_gen  = model.netD(fake)                     # G gradient flows through
+    errG        = criterion(output_gen, label_gen)
+
+    # Combined loss with live grad_fn – DO NOT detach or call .item()
+    loss = errD_real + errD_fake + errG
+    return loss
+```
+
+---
+
+Key design decisions worth noting:
+
+### GAN → single `nn.Module` (`GANModel`)
+The FL runtime expects one model object. `GANModel` owns both `netG` and `netD` as sub-modules so their weights are jointly federated and the runtime's optimizer can cover both.
+
+### `train_step` combined loss
+GAN training normally uses two separate optimisers in two sequential backward passes. Inside the single-pass FL contract that's impossible, so the step returns:
+
+```
+L = errD_real + errD_fake + errG
+```
+
+`fake.detach()` is used for the discriminator loss so D's gradient does **not** flow back through the generator, preserving the correct adversarial dynamic even within a single graph. `errG` keeps the undetached `fake` so the generator *does* receive gradients. The combined scalar has a live `grad_fn` as required.
+
+### Architecture parameters moved to constructor args
+The originals used module-level globals (`nz`, `ngf`, `ndf`, `nc`). Both `Generator` and `Discriminator` now accept these as explicit constructor arguments so they're fully self-contained and configurable via `config["model_kwargs"]`.
+
+### Synthetic-data gate
+The fallback `TensorDataset` is only created when `config.get("allow_synthetic_data", False)` is `True`; otherwise a `FileNotFoundError` with a descriptive message is raised immediately.

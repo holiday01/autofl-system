@@ -1,0 +1,190 @@
+import logging
+import os
+import sys
+import tempfile
+from glob import glob
+from typing import Dict, List, Any
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.tensorboard import SummaryWriter
+
+import monai
+from monai.data import create_test_image_3d, list_data_collate, decollate_batch
+from monai.inferers import sliding_window_inference
+from monai.metrics import DiceMetric
+from monai.transforms import (
+    Activations,
+    EnsureChannelFirstd,
+    AsDiscrete,
+    Compose,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+from monai.visualize import plot_2d_or_3d_image
+from monai.networks.nets import UNet
+from monai.losses import DiceLoss
+
+# Preserve original model class or define equivalent PyTorch model
+# In this case, the original script already uses MONAI's UNet, which is a torch.nn.Module.
+# So, we just import it and use it directly.
+
+# Custom MONAI Dataset to wrap transforms for build_dataloader
+class FLMONAIDataset(Dataset):
+    def __init__(self, data: List[Dict[str, str]], transform: Compose):
+        self.data = data
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx: int):
+        return self.transform(self.data[idx])
+
+def build_model(config: dict) -> torch.nn.Module:
+    """
+    Instantiate and return the model.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    # Default model parameters from the original script
+    default_model_kwargs = {
+        "spatial_dims": 3,
+        "in_channels": 1,
+        "out_channels": 1,
+        "channels": (16, 32, 64, 128, 256),
+        "strides": (2, 2, 2, 2),
+        "num_res_units": 2,
+    }
+    # Merge default and user-provided model_kwargs
+    merged_model_kwargs = {**default_model_kwargs, **model_kwargs}
+
+    model = UNet(**merged_model_kwargs)
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+    """
+    batch_size = config.get("local", {}).get("batch_size", 2) # Original script uses 2 for training, 1 for validation
+    num_workers = config.get("local", {}).get("num_workers", 4)
+    data_path = config.get("data_path", ".")
+    allow_synthetic_data = config.get("allow_synthetic_data", False)
+
+    files: List[Dict[str, str]] = []
+    
+    # Check if real data exists
+    image_files = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+    seg_files = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+
+    if not image_files or not seg_files:
+        if allow_synthetic_data:
+            logging.info(f"Generating synthetic data to {data_path} as real data not found.")
+            # Ensure the directory exists for synthetic data
+            os.makedirs(data_path, exist_ok=True)
+            for i in range(40):
+                im, seg = create_test_image_3d(128, 128, 128, num_seg_classes=1, channel_dim=-1)
+                n = nib.Nifti1Image(im, np.eye(4))
+                nib.save(n, os.path.join(data_path, f"img{i:d}.nii.gz"))
+                n = nib.Nifti1Image(seg, np.eye(4))
+                nib.save(n, os.path.join(data_path, f"seg{i:d}.nii.gz"))
+            image_files = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+            seg_files = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+        else:
+            raise FileNotFoundError(
+                f"No medical imaging data found at {data_path} (e.g., img*.nii.gz, seg*.nii.gz). "
+                "Set 'allow_synthetic_data: true' in config to use synthetic data."
+            )
+
+    files = [{"img": img, "seg": seg} for img, seg in zip(image_files, seg_files)]
+
+    # Define transforms for image and segmentation
+    train_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+            RandCropByPosNegLabeld(
+                keys=["img", "seg"], label_key="seg", spatial_size=[96, 96, 96], pos=1, neg=1, num_samples=4
+            ),
+            RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+        ]
+    )
+    val_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+        ]
+    )
+
+    # Use random_split to produce train/val subsets
+    # The original script uses 20 for train, 20 for val from 40 synthetic images.
+    # We will mimic this ratio, or use the exact numbers if available and small enough.
+    # For a general case, we use 0.5 split ratio.
+    num_total_samples = len(files)
+    if num_total_samples < 2:
+        raise ValueError(f"Not enough data samples ({num_total_samples}) to create train/val splits.")
+
+    train_size = num_total_samples // 2
+    val_size = num_total_samples - train_size
+    
+    # Ensure reproducibility for random_split if needed in config
+    generator = None
+    if config.get("seed") is not None:
+        generator = torch.Generator().manual_seed(config["seed"])
+
+    train_files_split, val_files_split = random_split(files, [train_size, val_size], generator=generator)
+
+    # The random_split gives Dataset objects, we need to extract the underlying data
+    train_data = [files[i] for i in train_files_split.indices]
+    val_data = [files[i] for i in val_files_split.indices]
+
+    if split == "train":
+        dataset = FLMONAIDataset(data=train_data, transform=train_transforms)
+        # Note: original script uses batch_size=2 for train, which results in 2*4=8 samples
+        # due to RandCropByPosNegLabeld. If batch_size for train is different from config,
+        # it might need adjustment based on how the FL runtime handles global batch size.
+        # Sticking to configured batch_size as requested.
+        loader_batch_size = batch_size
+        shuffle = True
+    elif split == "val":
+        dataset = FLMONAIDataset(data=val_data, transform=val_transforms)
+        # Original script uses batch_size=1 for validation
+        loader_batch_size = config.get("local", {}).get("val_batch_size", 1) # Specific val batch size
+        shuffle = False
+    else:
+        raise ValueError(f"Invalid split: {split}. Must be 'train' or 'val'.")
+
+    data_loader = DataLoader(
+        dataset,
+        batch_size=loader_batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=list_data_collate,
+        pin_memory=torch.cuda.is_available(),
+    )
+    return data_loader
+
+
+def train_step(model: torch.nn.Module, batch: Dict[str, torch.Tensor], optimizer: torch.optim.Optimizer, config: dict) -> torch.Tensor:
+    """
+    Run ONE forward pass only. Return the loss tensor WITH grad attached.
+    """
+    device = next(model.parameters()).device # Get model's device
+
+    inputs = batch["img"].to(device)
+    labels = batch["seg"].to(device)
+
+    # Instantiate loss function
+    loss_function = DiceLoss(sigmoid=True)
+
+    outputs = model(inputs)
+    loss = loss_function(outputs, labels)
+
+    # Do NOT call loss.backward() or optimizer.step()
+    return loss

@@ -1,0 +1,128 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: xgboost/sklearn examples (California Housing regression)
+
+Exposes:
+  build_model(config)                   -> nn.Module (wraps XGBRegressor)
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor
+
+CONTRACT:
+  - train_step fits the XGBoost model on one batch and returns the MSE loss.
+  - XGBoost is a tree-based model; the returned tensor will NOT carry a
+    grad_fn.  The FL runtime must NOT call loss.backward(); federated
+    averaging should operate over serialized booster state, not gradients.
+  - Do NOT call optimizer.step() inside train_step; XGBoost manages its
+    own internal parameter updates via .fit().
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from urllib.error import HTTPError
+from torch.utils.data import Dataset, DataLoader
+from sklearn.datasets import fetch_california_housing, make_regression
+from sklearn.model_selection import train_test_split
+import xgboost as xgb
+
+
+class CaliforniaHousingDataset(Dataset):
+    """California Housing dataset wrapped as a PyTorch Dataset for FL batching."""
+
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+class XGBRegressorModule(nn.Module):
+    """Thin nn.Module wrapper around XGBRegressor for FL runtime compatibility."""
+
+    def __init__(self, n_estimators: int = 100, max_depth: int = 4, n_jobs: int = 1, **kwargs):
+        super().__init__()
+        self._xgb = xgb.XGBRegressor(
+            n_estimators=n_estimators, max_depth=max_depth, n_jobs=n_jobs, **kwargs
+        )
+        self._fitted = False
+        # placeholder so next(model.parameters()) and model.to(device) don't raise
+        self._dummy = nn.Parameter(torch.zeros(1))
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        self._xgb.fit(X, y)
+        self._fitted = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        X_np = x.cpu().numpy()
+        preds = self._xgb.predict(X_np) if self._fitted else np.zeros(len(X_np), dtype=np.float32)
+        return torch.tensor(preds, dtype=torch.float32)
+
+
+# ── FL Interface ──────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return XGBRegressorModule(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 256))
+    num_workers = local.get("num_workers", config.get("num_workers", 0))
+
+    try:
+        X, y = fetch_california_housing(return_X_y=True)
+    except HTTPError:
+        X, y = make_regression(n_samples=20640, n_features=8, random_state=1234)
+        y = y.astype(np.float32)
+
+    val_ratio = config.get("val_ratio", 0.2)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y,
+        test_size=val_ratio,
+        random_state=config.get("seed", 42),
+    )
+    X_split, y_split = (X_train, y_train) if split == "train" else (X_val, y_val)
+    dataset = CaliforniaHousingDataset(X_split, y_split)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    Fits XGBoost on one batch and returns the MSE loss as a scalar tensor.
+
+    NOTE: The returned tensor does NOT carry a grad_fn because XGBoost is
+    tree-based.  The FL runtime must not call loss.backward() on this value;
+    it should federate booster state (via model._xgb.get_booster()) instead.
+    """
+    if isinstance(batch, (list, tuple)):
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        inputs  = batch.get("input", batch.get("x"))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    X_np = inputs.cpu().numpy()
+    y_np = targets.cpu().numpy()
+
+    model.fit(X_np, y_np)
+    preds = model(inputs)
+    loss = F.mse_loss(preds, targets.float())
+    return loss
+```

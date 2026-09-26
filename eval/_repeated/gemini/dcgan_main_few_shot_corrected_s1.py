@@ -1,0 +1,258 @@
+"""
+Auto-generated FL client module.
+Original script: dcgan.py (DCGAN from PyTorch examples)
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+
+NOTE ON GAN CONVERSION:
+This client module is designed to train only the Discriminator on real images,
+adhering strictly to the single-model, single-objective `train_step` contract
+provided in the example. A full GAN training loop with two networks and
+adversarial objectives cannot be directly mapped to this contract without
+significant modifications to the FL runtime's expectations (e.g., handling
+multiple models/optimizers or a composite `train_step`).
+"""
+import os
+import random
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn # Although cudnn.benchmark usually set globally
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+# torchvision.utils is typically used for visualization outside the FL client's core functions.
+
+
+# Helper for weights initialization (from original script)
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        torch.nn.init.normal_(m.weight, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        torch.nn.init.normal_(m.weight, 1.0, 0.02)
+        torch.nn.init.zeros_(m.bias)
+
+
+# --- Model Definitions (adapted from original script) ---
+# Generator is included for completeness, but not directly used by this client's `train_step`
+# as per the single-model contract.
+class Generator(nn.Module):
+    def __init__(self, ngpu: int, nz: int, ngf: int, nc: int):
+        super(Generator, self).__init__()
+        self.ngpu = ngpu
+        self.main = nn.Sequential(
+            # input is Z, going into a convolution
+            nn.ConvTranspose2d(     nz, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            # state size. (ngf*8) x 4 x 4
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            # state size. (ngf*4) x 8 x 8
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+            # state size. (ngf*2) x 16 x 16
+            nn.ConvTranspose2d(ngf * 2,     ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            # state size. (ngf) x 32 x 32
+            nn.ConvTranspose2d(    ngf,      nc, 4, 2, 1, bias=False),
+            nn.Tanh()
+            # state size. (nc) x 64 x 64
+        )
+
+    def forward(self, input):
+        # The original script includes logic for multiple GPUs/accelerators
+        # The `is_xpu` check is for PyTorch/XLA compatibility
+        if (input.is_cuda or (hasattr(input, 'is_xpu') and input.is_xpu)) and self.ngpu > 1:
+            output = nn.parallel.data_parallel(self.main, input, list(range(self.ngpu)))
+        else:
+            output = self.main(input)
+        return output
+
+
+class Discriminator(nn.Module):
+    def __init__(self, ngpu: int, nc: int, ndf: int):
+        super(Discriminator, self).__init__()
+        self.ngpu = ngpu
+        self.main = nn.Sequential(
+            # input is (nc) x 64 x 64
+            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf) x 32 x 32
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*2) x 16 x 16
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*4) x 8 x 8
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*8) x 4 x 4
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, input):
+        if (input.is_cuda or (hasattr(input, 'is_xpu') and input.is_xpu)) and self.ngpu > 1:
+            output = nn.parallel.data_parallel(self.main, input, list(range(self.ngpu)))
+        else:
+            output = self.main(input)
+        return output.view(-1, 1).squeeze(1)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    # This FL client module will only instantiate and federate the Discriminator.
+    # The Generator is defined above but not used in this client's `build_model`
+    # or `train_step` to adhere to the single-model contract.
+    model_kwargs = config.get("model_kwargs", {})
+    ngpu = config.get("ngpu", 1)
+
+    # Determine number of channels based on dataset (default to 3 for common datasets)
+    dataset_name = config.get("dataset", "cifar10").lower()
+    _nc_map = {
+        'imagenet': 3, 'folder': 3, 'lfw': 3, 'lsun': 3,
+        'cifar10': 3, 'mnist': 1, 'fake': 3
+    }
+    nc = config.get("nc", _nc_map.get(dataset_name, 3))
+    config["nc"] = nc # Update config with determined nc for consistency
+
+    ndf = config.get("ndf", 64) # Discriminator filter multiplier
+
+    model = Discriminator(ngpu=ngpu, nc=nc, ndf=ndf, **model_kwargs.get("D", {}))
+    model.apply(weights_init)
+
+    # Load pretrained weights if specified (for continued training)
+    if config.get("netD", ""):
+        try:
+            model.load_state_dict(torch.load(config["netD"]))
+        except Exception as e:
+            print(f"Warning: Could not load Discriminator checkpoint from {config['netD']}: {e}")
+            pass
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> torch.utils.data.DataLoader:
+    # The original script does not have a separate validation split for data.
+    # We provide the full dataset as the "train" split, suitable for discriminator training.
+
+    local = config.get("local", {})
+    batch_size = local.get("batch_size", config.get("batch_size", 64))
+    num_workers = local.get("num_workers", config.get("workers", 2))
+    pin_memory = local.get("pin_memory", True)
+
+    dataroot = config.get("dataroot", ".")
+    dataset_name = config.get("dataset", "cifar10").lower()
+    image_size = config.get("imageSize", 64)
+
+    # Determine number of channels based on dataset (default to 3 for common datasets)
+    _nc_map = {
+        'imagenet': 3, 'folder': 3, 'lfw': 3, 'lsun': 3,
+        'cifar10': 3, 'mnist': 1, 'fake': 3
+    }
+    nc = config.get("nc", _nc_map.get(dataset_name, 3))
+    config["nc"] = nc # Ensure config has `nc` for `build_model` and `train_step`
+
+    transform_list = [
+        transforms.Resize(image_size),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+    ]
+    if nc == 1: # MNIST
+        transform_list.append(transforms.Normalize((0.5,), (0.5,)))
+    else: # CIFAR10, LSUN, ImageNet, etc.
+        transform_list.append(transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)))
+    transform = transforms.Compose(transform_list)
+
+    dataset = None
+    if dataset_name == 'imagenet' or dataset_name == 'folder' or dataset_name == 'lfw':
+        dataset = dset.ImageFolder(root=dataroot, transform=transform)
+    elif dataset_name == 'lsun':
+        classes = [c + '_train' for c in config.get('classes', 'bedroom').split(',')]
+        dataset = dset.LSUN(root=dataroot, classes=classes, transform=transform)
+    elif dataset_name == 'cifar10':
+        dataset = dset.CIFAR10(root=dataroot, download=config.get("download_dataset", True), transform=transform)
+    elif dataset_name == 'mnist':
+        dataset = dset.MNIST(root=dataroot, download=config.get("download_dataset", True), transform=transform)
+    elif dataset_name == 'fake':
+        # Original script used (3, image_size, image_size) for FakeData
+        dataset = dset.FakeData(image_size=(3, image_size, image_size), transform=transforms.ToTensor())
+        config["nc"] = 3 # Ensure nc is 3 if fake dataset is chosen, overriding other defaults
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+    assert dataset, f"Dataset could not be loaded for {dataset_name} at {dataroot}. Check dataset name and path."
+
+    # The original script shuffles the full dataset for training, no explicit val split.
+    # The `split` argument might be used by the FL runtime to distinguish client training vs. evaluation,
+    # but the underlying dataset is the same for now.
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"), # Always shuffle for training
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer, # Optimizer is not used directly here due to contract
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass for the Discriminator training on REAL images.
+    Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+
+    NOTE: This `train_step` ONLY computes the Discriminator's loss on real images.
+    It does NOT include the Generator, fake image generation, or the
+    Discriminator's loss on fake images. This design strictly adheres to the
+    `train_step` contract in the provided exemplar, which assumes a single model,
+    a single forward pass, and a single loss computation per step.
+    A full GAN training procedure requires a more complex `train_step` or
+    multiple specialized `train_step` functions in the FL framework.
+    """
+    device = next(model.parameters()).device
+    
+    # Assume batch contains (real_images, ) or (real_images, some_label_if_any)
+    # The original script uses data[0] for images.
+    real_cpu = batch[0].to(device)
+    
+    # `model` is expected to be the Discriminator instance from `build_model`.
+
+    # Get labels from config (original script used 1 for real_label)
+    real_label = config.get("real_label", 1)
+    
+    batch_size = real_cpu.size(0)
+    label = torch.full((batch_size,), real_label,
+                       dtype=real_cpu.dtype, device=device)
+
+    # Discriminator forward pass on real images
+    output = model(real_cpu)
+    criterion = nn.BCELoss() # Binary Cross Entropy Loss from original script
+    loss = criterion(output, label)
+    
+    return loss

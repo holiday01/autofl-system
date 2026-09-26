@@ -1,0 +1,221 @@
+```python
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from torchvision import datasets, transforms
+
+
+# ---------------------------------------------------------------------------
+# Model (PyTorch equivalent of make_model() from the original Keras script)
+# The Keras Rescaling(1/255) layer is omitted here because torchvision's
+# ToTensor() transform already maps pixel values to [0, 1].  All other
+# architectural choices — residual blocks, depthwise-separable convolutions,
+# filter sizes, dropout, binary output head — are preserved verbatim.
+# ---------------------------------------------------------------------------
+
+class SeparableConv2d(nn.Module):
+    """Depthwise-separable convolution; equivalent to Keras SeparableConv2D."""
+
+    def __init__(self, in_channels: int, out_channels: int,
+                 kernel_size: int = 3, padding: int = 1):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size,
+            padding=padding, groups=in_channels, bias=False,
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pointwise(self.depthwise(x))
+
+
+class MiniXception(nn.Module):
+    """
+    PyTorch equivalent of make_model(input_shape=(180,180,3), num_classes=2).
+
+    Spatial trace for 180×180 input:
+      entry Conv(stride=2) → 90×90
+      block-1 MaxPool(stride=2) → 45×45
+      block-2 MaxPool(stride=2) → 23×23
+      block-3 MaxPool(stride=2) → 12×12
+      exit SepConv → 12×12
+      GlobalAvgPool → 1×1 → flatten → 1024 → Linear(1)
+    """
+
+    def __init__(self, input_channels: int = 3, num_classes: int = 2):
+        super().__init__()
+
+        # ── Entry block ──────────────────────────────────────────────────────
+        self.entry_conv = nn.Conv2d(
+            input_channels, 128, kernel_size=3, stride=2, padding=1, bias=False
+        )
+        self.entry_bn = nn.BatchNorm2d(128)
+
+        # ── Three residual blocks (sizes 256 / 512 / 728) ────────────────────
+        self.res_blocks = nn.ModuleList()
+        self.res_shortcuts = nn.ModuleList()
+        in_ch = 128
+        for size in [256, 512, 728]:
+            # Mirrors: relu → SepConv → BN → relu → SepConv → BN → MaxPool
+            self.res_blocks.append(nn.Sequential(
+                nn.ReLU(),
+                SeparableConv2d(in_ch, size),
+                nn.BatchNorm2d(size),
+                nn.ReLU(),
+                SeparableConv2d(size, size),
+                nn.BatchNorm2d(size),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            ))
+            # Matches Keras Conv2D(size, 1, strides=2, padding="same")
+            self.res_shortcuts.append(
+                nn.Conv2d(in_ch, size, kernel_size=1, stride=2, bias=False)
+            )
+            in_ch = size  # 128 → 256 → 512 → 728
+
+        # ── Exit block ────────────────────────────────────────────────────────
+        self.exit_sep = SeparableConv2d(728, 1024)
+        self.exit_bn = nn.BatchNorm2d(1024)
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=0.25)
+
+        units = 1 if num_classes == 2 else num_classes
+        self.fc = nn.Linear(1024, units)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Entry
+        x = F.relu(self.entry_bn(self.entry_conv(x)))
+        prev = x
+
+        # Residual blocks
+        for block, shortcut in zip(self.res_blocks, self.res_shortcuts):
+            x = block(x) + shortcut(prev)
+            prev = x
+
+        # Exit
+        x = F.relu(self.exit_bn(self.exit_sep(x)))
+        x = self.gap(x).flatten(1)   # (B, 1024)
+        x = self.dropout(x)
+        return self.fc(x)             # (B, 1) for binary classification
+
+
+# ---------------------------------------------------------------------------
+# FL interface
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> nn.Module:
+    """Instantiate and return the MiniXception model.
+
+    Recognised model_kwargs:
+      input_channels (int, default 3)
+      num_classes    (int, default 2)
+    """
+    kwargs = config.get("model_kwargs", {})
+    return MiniXception(
+        input_channels=kwargs.get("input_channels", 3),
+        num_classes=kwargs.get("num_classes", 2),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split ('train' or 'val').
+
+    Expects the Cats-vs-Dogs layout:
+        <data_path>/PetImages/Cat/   and   <data_path>/PetImages/Dog/
+
+    If the directory is absent and config['allow_synthetic_data'] is False
+    (the default), a FileNotFoundError is raised.  Only when that flag is
+    explicitly True will a small synthetic dataset be used as a fallback.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    image_size = config.get("model_kwargs", {}).get("image_size", (180, 180))
+    if isinstance(image_size, int):
+        image_size = (image_size, image_size)
+
+    # Augmentation for training mirrors the original script:
+    #   RandomFlip("horizontal")  → RandomHorizontalFlip()
+    #   RandomRotation(0.1)       → ±0.1 × 360° = ±36°
+    train_transform = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(degrees=36),
+        transforms.ToTensor(),   # uint8 [0,255] → float32 [0,1]
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ])
+
+    transform = train_transform if split == "train" else val_transform
+    pets_path = os.path.join(data_path, "PetImages")
+
+    if not os.path.isdir(pets_path):
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Dataset directory not found at '{pets_path}'. "
+                "Place the Cats-vs-Dogs data (PetImages/Cat/ and PetImages/Dog/) "
+                "under data_path, or set config['allow_synthetic_data']=True to "
+                "use synthetic data for testing purposes."
+            )
+        # ── Synthetic fallback (only when explicitly allowed) ─────────────────
+        h, w = image_size
+        n_synth = 200
+        X = torch.randn(n_synth, 3, h, w)
+        y = torch.randint(0, 2, (n_synth,))
+        full_ds = TensorDataset(X, y)
+    else:
+        full_ds = datasets.ImageFolder(pets_path, transform=transform)
+
+    n_total = len(full_ds)
+    n_val = max(1, int(0.2 * n_total))
+    n_train = n_total - n_val
+    train_ds, val_ds = random_split(
+        full_ds,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(1337),
+    )
+
+    chosen = train_ds if split == "train" else val_ds
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=config.get("num_workers", 2),
+        pin_memory=True,
+        drop_last=(split == "train"),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Run a single forward pass and return the loss tensor.
+
+    The grad_fn is preserved (loss is NOT detached).
+    The FL runtime is responsible for calling loss.backward() and
+    optimizer.step(); this function must not call either.
+    """
+    device = next(model.parameters()).device
+    images, labels = batch
+    images = images.to(device)
+
+    num_classes = config.get("model_kwargs", {}).get("num_classes", 2)
+    logits = model(images)   # (B, 1) for binary; (B, C) for multi-class
+
+    if num_classes == 2:
+        # Mirrors Keras BinaryCrossentropy(from_logits=True)
+        labels = labels.float().to(device)
+        loss = F.binary_cross_entropy_with_logits(logits.squeeze(1), labels)
+    else:
+        labels = labels.long().to(device)
+        loss = F.cross_entropy(logits, labels)
+
+    return loss
+```

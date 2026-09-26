@@ -1,0 +1,303 @@
+"""
+Auto-generated FL client module.
+Original script: pytorch/examples word_language_model/main.py (RNN/Transformer language model)
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+
+  Vocabulary / ntoken: call build_dataloader before build_model; it writes
+  config["ntoken"] from the real corpus (or synthetic fallback).
+
+  Hidden-state note: For RNN/LSTM/GRU models, hidden state is re-initialised
+  fresh each train_step call (no cross-batch BPTT dependency). This keeps
+  train_step stateless, satisfying the FL runtime's batch-independent contract.
+"""
+import math
+import os
+from io import open as _open
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+
+# ── Vocabulary / corpus utilities ──────────────────────────────────────────
+
+class Dictionary:
+    def __init__(self):
+        self.word2idx = {}
+        self.idx2word = []
+
+    def add_word(self, word):
+        if word not in self.word2idx:
+            self.idx2word.append(word)
+            self.word2idx[word] = len(self.idx2word) - 1
+        return self.word2idx[word]
+
+    def __len__(self):
+        return len(self.idx2word)
+
+
+class Corpus:
+    def __init__(self, path):
+        self.dictionary = Dictionary()
+        self.train = self._tokenize(os.path.join(path, "train.txt"))
+        self.valid = self._tokenize(os.path.join(path, "valid.txt"))
+        self.test  = self._tokenize(os.path.join(path, "test.txt"))
+
+    def _tokenize(self, path):
+        assert os.path.exists(path), f"Missing corpus file: {path}"
+        with _open(path, "r", encoding="utf8") as f:
+            for line in f:
+                for word in line.split() + ["<eos>"]:
+                    self.dictionary.add_word(word)
+        with _open(path, "r", encoding="utf8") as f:
+            idss = []
+            for line in f:
+                ids = [self.dictionary.word2idx[w] for w in line.split() + ["<eos>"]]
+                idss.append(torch.tensor(ids, dtype=torch.int64))
+        return torch.cat(idss)
+
+
+# ── BPTT Dataset ─────────────────────────────────────────────────────────────
+
+class BPTTDataset(Dataset):
+    """
+    Exposes each BPTT window of an already-batchified token matrix as a
+    (src, target) pair: src shape (seq_len, bsz), target shape (seq_len*bsz,).
+    """
+    def __init__(self, flat_data: torch.Tensor, bptt: int):
+        self.data = flat_data   # shape: (T, bsz)
+        self.bptt = bptt
+        self.n = max(0, flat_data.size(0) - 1) // bptt
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        i = idx * self.bptt
+        seq_len = min(self.bptt, self.data.size(0) - 1 - i)
+        src = self.data[i : i + seq_len]
+        tgt = self.data[i + 1 : i + 1 + seq_len].reshape(-1)
+        return src, tgt
+
+
+def _batchify(token_ids: torch.Tensor, bsz: int) -> torch.Tensor:
+    nbatch = token_ids.size(0) // bsz
+    token_ids = token_ids.narrow(0, 0, nbatch * bsz)
+    return token_ids.view(bsz, -1).t().contiguous()   # (T, bsz)
+
+
+def _bptt_collate(batch):
+    # batch is a list of one (src, tgt) pair — unwrap without stacking
+    return batch[0]
+
+
+# ── Models ───────────────────────────────────────────────────────────────────
+
+class RNNModel(nn.Module):
+    def __init__(self, rnn_type, ntoken, ninp, nhid, nlayers, dropout=0.5, tie_weights=False):
+        super().__init__()
+        self.ntoken = ntoken
+        self.drop = nn.Dropout(dropout)
+        self.encoder = nn.Embedding(ntoken, ninp)
+        if rnn_type in ("LSTM", "GRU"):
+            self.rnn = getattr(nn, rnn_type)(ninp, nhid, nlayers, dropout=dropout)
+        else:
+            nl = {"RNN_TANH": "tanh", "RNN_RELU": "relu"}.get(rnn_type)
+            if nl is None:
+                raise ValueError(f"Invalid rnn_type '{rnn_type}'")
+            self.rnn = nn.RNN(ninp, nhid, nlayers, nonlinearity=nl, dropout=dropout)
+        self.decoder = nn.Linear(nhid, ntoken)
+        if tie_weights:
+            if nhid != ninp:
+                raise ValueError("nhid must equal ninp when tie_weights=True")
+            self.decoder.weight = self.encoder.weight
+        self._init_weights()
+        self.rnn_type = rnn_type
+        self.nhid = nhid
+        self.nlayers = nlayers
+
+    def _init_weights(self):
+        r = 0.1
+        nn.init.uniform_(self.encoder.weight, -r, r)
+        nn.init.zeros_(self.decoder.bias)
+        nn.init.uniform_(self.decoder.weight, -r, r)
+
+    def init_hidden(self, bsz):
+        w = next(self.parameters())
+        if self.rnn_type == "LSTM":
+            return (w.new_zeros(self.nlayers, bsz, self.nhid),
+                    w.new_zeros(self.nlayers, bsz, self.nhid))
+        return w.new_zeros(self.nlayers, bsz, self.nhid)
+
+    def forward(self, src, hidden):
+        emb = self.drop(self.encoder(src))
+        out, hidden = self.rnn(emb, hidden)
+        out = self.drop(out)
+        decoded = self.decoder(out).view(-1, self.ntoken)
+        return F.log_softmax(decoded, dim=1), hidden
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        x = x + self.pe[: x.size(0), :]
+        return self.dropout(x)
+
+
+class TransformerModel(nn.Transformer):
+    def __init__(self, ntoken, ninp, nhead, nhid, nlayers, dropout=0.5):
+        super().__init__(
+            d_model=ninp, nhead=nhead, dim_feedforward=nhid, num_encoder_layers=nlayers
+        )
+        self.ntoken = ntoken
+        self.src_mask = None
+        self.pos_encoder = PositionalEncoding(ninp, dropout)
+        self.input_emb = nn.Embedding(ntoken, ninp)
+        self.ninp = ninp
+        self.decoder = nn.Linear(ninp, ntoken)
+        self._init_weights()
+
+    def _generate_square_subsequent_mask(self, sz):
+        return torch.log(torch.tril(torch.ones(sz, sz)))
+
+    def _init_weights(self):
+        r = 0.1
+        nn.init.uniform_(self.input_emb.weight, -r, r)
+        nn.init.zeros_(self.decoder.bias)
+        nn.init.uniform_(self.decoder.weight, -r, r)
+
+    def forward(self, src, has_mask=True):
+        if has_mask:
+            device = src.device
+            if self.src_mask is None or self.src_mask.size(0) != len(src):
+                self.src_mask = self._generate_square_subsequent_mask(len(src)).to(device)
+        else:
+            self.src_mask = None
+        src = self.input_emb(src) * math.sqrt(self.ninp)
+        src = self.pos_encoder(src)
+        output = self.encoder(src, mask=self.src_mask)
+        output = self.decoder(output)
+        return F.log_softmax(output, dim=-1)
+
+
+# ── FL Interface ──────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    config["ntoken"]     : vocabulary size — set automatically by build_dataloader.
+    config["model_type"] : "LSTM" | "GRU" | "RNN_TANH" | "RNN_RELU" | "Transformer"
+    config["model_kwargs"]: forwarded to the model constructor.
+    """
+    ntoken = config.get("ntoken")
+    if ntoken is None:
+        raise ValueError(
+            "config['ntoken'] is not set; call build_dataloader first to populate it."
+        )
+    model_type = config.get("model_type", "LSTM")
+    kw = config.get("model_kwargs", {})
+    if model_type == "Transformer":
+        return TransformerModel(
+            ntoken=ntoken,
+            ninp=kw.get("ninp", 200),
+            nhead=kw.get("nhead", 2),
+            nhid=kw.get("nhid", 200),
+            nlayers=kw.get("nlayers", 2),
+            dropout=kw.get("dropout", 0.2),
+        )
+    return RNNModel(
+        rnn_type=model_type,
+        ntoken=ntoken,
+        ninp=kw.get("ninp", 200),
+        nhid=kw.get("nhid", 200),
+        nlayers=kw.get("nlayers", 2),
+        dropout=kw.get("dropout", 0.2),
+        tie_weights=kw.get("tie_weights", False),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Loads the text corpus, batchifies it, and wraps BPTT windows in a DataLoader.
+    Writes config["ntoken"] from the real vocabulary (or synthetic fallback) so
+    a subsequent build_model call can read it.
+    Falls back to a synthetic token stream when corpus files are absent.
+    """
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 20))
+    num_workers = local.get("num_workers", config.get("num_workers", 0))
+    pin_memory  = local.get("pin_memory", True)
+    bptt        = config.get("bptt", 35)
+    data_path   = config.get("data_path", "./data/wikitext-2")
+
+    try:
+        corpus = Corpus(data_path)
+        raw = {"train": corpus.train, "valid": corpus.valid, "test": corpus.test}[split]
+        config["ntoken"] = len(corpus.dictionary)
+    except (AssertionError, FileNotFoundError, KeyError):
+        ntokens = config.get("ntoken", 1000)
+        raw = torch.randint(0, ntokens, (batch_size * bptt * 50,))
+        config["ntoken"] = ntokens
+
+    flat    = _batchify(raw, batch_size)
+    dataset = BPTTDataset(flat, bptt)
+    return DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,          # BPTT order must be preserved
+        num_workers=num_workers,
+        collate_fn=_bptt_collate,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+
+    batch: (src, targets) where src is (seq_len, bsz) and targets is (seq_len*bsz,).
+    Hidden state is re-initialised per call; no cross-batch state is maintained.
+    """
+    device = next(model.parameters()).device
+    src, targets = batch[0].to(device), batch[1].to(device)
+    criterion = nn.NLLLoss()
+
+    if isinstance(model, TransformerModel):
+        output = model(src)
+        output = output.view(-1, model.ntoken)
+    else:
+        hidden = model.init_hidden(src.size(1))
+        output, _ = model(src, hidden)   # (seq_len*bsz, ntoken)
+
+    return criterion(output, targets)

@@ -1,0 +1,325 @@
+"""
+Auto-generated FL client module.
+Original script: https://keras.io/examples/generative/lstm_seq2seq/
+
+Exposes:
+  build_model(config)               -> keras.Model
+  build_dataloader(config, split)   -> keras.utils.Sequence
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np
+import keras
+from pathlib import Path
+import tensorflow as tf
+
+# --- Data Preparation Utilities (Cached) ---
+
+_data_dir = None
+_processed_data_cache = {}
+
+def _prepare_data_artifacts(config: dict):
+    """
+    Prepares and caches data-dependent artifacts like token indices and max sequence lengths.
+    Downloads and unzips the dataset if not present.
+    """
+    global _data_dir, _processed_data_cache
+
+    local_config = config.get("local", {})
+    num_samples_limit = local_config.get("num_samples", config.get("num_samples", 10000))
+    data_path_conf = local_config.get("data_path", config.get("data_path", "fra.txt"))
+
+    # Determine actual data path (after download/unzip)
+    resolved_data_path = data_path_conf
+
+    # Check cache first
+    cache_key = (num_samples_limit, resolved_data_path)
+    if cache_key in _processed_data_cache:
+        return _processed_data_cache[cache_key]
+
+    if _data_dir is None:
+        # Keras `get_file` downloads to ~/.keras/datasets/
+        fpath = keras.utils.get_file(origin="http://www.manythings.org/anki/fra-eng.zip", cache_subdir="keras-datasets")
+        _data_dir = Path(fpath).parent.absolute()
+        
+        fra_txt_target_path = Path(os.path.join(_data_dir, "fra.txt"))
+        if not fra_txt_target_path.exists():
+            # Only unzip if fra.txt doesn't exist
+            os.system(f"unzip -q {fpath} -d {_data_dir}")
+        resolved_data_path = str(fra_txt_target_path)
+    
+    # If data_path in config points to the unzipped file directly, use it.
+    # Otherwise, assume it means "fra.txt" inside the downloaded archive's location.
+    if os.path.isabs(data_path_conf) and os.path.exists(data_path_conf):
+        resolved_data_path = data_path_conf
+    elif os.path.exists(os.path.join(_data_dir, data_path_conf)):
+        resolved_data_path = os.path.join(_data_dir, data_path_conf)
+    elif not os.path.exists(resolved_data_path): # If the initial resolve (to fra.txt in _data_dir) doesn't exist
+        raise FileNotFoundError(f"Data file not found: {resolved_data_path}. Please ensure it's accessible or correctly configured.")
+
+    input_texts = []
+    target_texts = []
+    input_characters = set()
+    target_characters = set()
+    with open(resolved_data_path, "r", encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    
+    # Filter out empty lines and apply num_samples limit
+    valid_lines = [line for line in lines if line.strip()]
+    
+    for line in valid_lines[: min(num_samples_limit, len(valid_lines))]:
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        input_text, target_text = parts[0], parts[1]
+        target_text = "\t" + target_text + "\n"  # Add start/end tokens
+        input_texts.append(input_text)
+        target_texts.append(target_text)
+        for char in input_text:
+            input_characters.add(char)
+        for char in target_text:
+            target_characters.add(char)
+
+    input_characters = sorted(list(input_characters))
+    target_characters = sorted(list(target_characters))
+
+    # Add space character for padding if not already present
+    if ' ' not in input_characters:
+        input_characters.append(' ')
+    if ' ' not in target_characters:
+        target_characters.append(' ')
+
+    num_encoder_tokens = len(input_characters)
+    num_decoder_tokens = len(target_characters)
+    max_encoder_seq_length = max([len(txt) for txt in input_texts]) if input_texts else 1
+    max_decoder_seq_length = max([len(txt) for txt in target_texts]) if target_texts else 1
+
+    input_token_index = dict([(char, i) for i, char in enumerate(input_characters)])
+    target_token_index = dict([(char, i) for i, char in enumerate(target_characters)])
+
+    processed_data = {
+        "input_texts": input_texts,
+        "target_texts": target_texts,
+        "input_token_index": input_token_index,
+        "target_token_index": target_token_index,
+        "num_encoder_tokens": num_encoder_tokens,
+        "num_decoder_tokens": num_decoder_tokens,
+        "max_encoder_seq_length": max_encoder_seq_length,
+        "max_decoder_seq_length": max_decoder_seq_length,
+    }
+    _processed_data_cache[cache_key] = processed_data
+    return processed_data
+
+
+class Seq2SeqSequence(keras.utils.Sequence):
+    """
+    A Keras Sequence to generate batches of one-hot encoded sequence-to-sequence data.
+    """
+    def __init__(self, input_texts_subset: list, target_texts_subset: list,
+                 input_token_index: dict, target_token_index: dict,
+                 num_encoder_tokens: int, num_decoder_tokens: int,
+                 max_encoder_seq_length: int, max_decoder_seq_length: int,
+                 batch_size: int):
+        self.input_texts = input_texts_subset
+        self.target_texts = target_texts_subset
+        self.input_token_index = input_token_index
+        self.target_token_index = target_token_index
+        self.num_encoder_tokens = num_encoder_tokens
+        self.num_decoder_tokens = num_decoder_tokens
+        self.max_encoder_seq_length = max_encoder_seq_length
+        self.max_decoder_seq_length = max_decoder_seq_length
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return int(np.ceil(len(self.input_texts) / self.batch_size))
+
+    def __getitem__(self, idx):
+        # Generate data for one batch
+        start_idx = idx * self.batch_size
+        end_idx = min((idx + 1) * self.batch_size, len(self.input_texts))
+        
+        batch_input_texts = self.input_texts[start_idx:end_idx]
+        batch_target_texts = self.target_texts[start_idx:end_idx]
+
+        batch_size_actual = len(batch_input_texts)
+
+        encoder_input_data = np.zeros(
+            (batch_size_actual, self.max_encoder_seq_length, self.num_encoder_tokens),
+            dtype="float32",
+        )
+        decoder_input_data = np.zeros(
+            (batch_size_actual, self.max_decoder_seq_length, self.num_decoder_tokens),
+            dtype="float32",
+        )
+        decoder_target_data = np.zeros(
+            (batch_size_actual, self.max_decoder_seq_length, self.num_decoder_tokens),
+            dtype="float32",
+        )
+
+        for j, (input_text, target_text) in enumerate(zip(batch_input_texts, batch_target_texts)):
+            # Encoder input
+            for t, char in enumerate(input_text):
+                if char in self.input_token_index:
+                    encoder_input_data[j, t, self.input_token_index[char]] = 1.0
+            # Pad with spaces
+            for t_pad in range(len(input_text), self.max_encoder_seq_length):
+                if ' ' in self.input_token_index:
+                    encoder_input_data[j, t_pad, self.input_token_index[" "]] = 1.0
+
+            # Decoder input and target
+            for t, char in enumerate(target_text):
+                if char in self.target_token_index:
+                    decoder_input_data[j, t, self.target_token_index[char]] = 1.0
+                    if t > 0: # decoder_target_data is ahead by one timestep
+                        decoder_target_data[j, t - 1, self.target_token_index[char]] = 1.0
+            
+            # Pad decoder input with spaces
+            for t_pad in range(len(target_text), self.max_decoder_seq_length):
+                if ' ' in self.target_token_index:
+                    decoder_input_data[j, t_pad, self.target_token_index[" "]] = 1.0
+            
+            # Pad decoder target data (which is shifted by one)
+            if ' ' in self.target_token_index:
+                # The target data is filled up to index `len(target_text) - 2`.
+                # So from `len(target_text) - 1` onwards needs padding.
+                for t_pad in range(max(0, len(target_text) - 1), self.max_decoder_seq_length):
+                    decoder_target_data[j, t_pad, self.target_token_index[" "]] = 1.0
+
+        # Keras expects (inputs, targets) where inputs can be a list/tuple
+        return [tf.constant(encoder_input_data), tf.constant(decoder_input_data)], tf.constant(decoder_target_data)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    """
+    Builds and returns the Keras Seq2Seq model.
+    The model architecture is defined by parameters extracted from the config.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    latent_dim = model_kwargs.get("latent_dim", config.get("latent_dim", 256))
+    
+    # Retrieve data-dependent parameters from config.
+    # These are expected to be populated by build_dataloader if not explicitly set.
+    num_encoder_tokens = config.get("num_encoder_tokens")
+    num_decoder_tokens = config.get("num_decoder_tokens")
+
+    if num_encoder_tokens is None or num_decoder_tokens is None:
+        # Fallback for when config might not be pre-populated (e.g., in some testing scenarios).
+        # This will trigger data processing again, which is not ideal but ensures model can be built.
+        print("Warning: `num_encoder_tokens` or `num_decoder_tokens` not found in config. Attempting to derive from data.")
+        processed_data = _prepare_data_artifacts(config)
+        num_encoder_tokens = processed_data["num_encoder_tokens"]
+        num_decoder_tokens = processed_data["num_decoder_tokens"]
+
+    # Define an input sequence and process it.
+    encoder_inputs = keras.Input(shape=(None, num_encoder_tokens), name="encoder_inputs")
+    encoder = keras.layers.LSTM(latent_dim, return_state=True, name="encoder_lstm")
+    encoder_outputs, state_h, state_c = encoder(encoder_inputs)
+    encoder_states = [state_h, state_c]
+
+    # Set up the decoder, using `encoder_states` as initial state.
+    decoder_inputs = keras.Input(shape=(None, num_decoder_tokens), name="decoder_inputs")
+    decoder_lstm = keras.layers.LSTM(latent_dim, return_sequences=True, return_state=True, name="decoder_lstm")
+    decoder_outputs, _, _ = decoder_lstm(decoder_inputs, initial_state=encoder_states)
+    decoder_dense = keras.layers.Dense(num_decoder_tokens, activation="softmax", name="decoder_dense")
+    decoder_outputs = decoder_dense(decoder_outputs)
+
+    model = keras.Model([encoder_inputs, decoder_inputs], decoder_outputs, name="seq2seq_model")
+    
+    # The FL runtime is expected to compile the model with an optimizer and loss function.
+    # We do not call model.compile here as per the contract.
+    
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> keras.utils.Sequence:
+    """
+    Prepares and returns a Keras Sequence for the specified data split ('train' or 'val').
+    It also populates the config with data-dependent parameters required for model building.
+    """
+    local_config = config.get("local", {})
+    batch_size = local_config.get("batch_size", config.get("batch_size", 64))
+    val_ratio = config.get("val_ratio", 0.2) # Original script uses 0.2
+
+    # Prepare data and get parameters
+    processed_data = _prepare_data_artifacts(config)
+    input_texts = processed_data["input_texts"]
+    target_texts = processed_data["target_texts"]
+    input_token_index = processed_data["input_token_index"]
+    target_token_index = processed_data["target_token_index"]
+    num_encoder_tokens = processed_data["num_encoder_tokens"]
+    num_decoder_tokens = processed_data["num_decoder_tokens"]
+    max_encoder_seq_length = processed_data["max_encoder_seq_length"]
+    max_decoder_seq_length = processed_data["max_decoder_seq_length"]
+
+    # Update config with these derived parameters, so build_model can access them.
+    # This assumes the config is mutable and shared, or explicitly passed back and forth
+    # by the FL runtime.
+    config["num_encoder_tokens"] = num_encoder_tokens
+    config["num_decoder_tokens"] = num_decoder_tokens
+    config["max_encoder_seq_length"] = max_encoder_seq_length
+    config["max_decoder_seq_length"] = max_decoder_seq_length
+    config["input_token_index"] = input_token_index # useful for inference/metrics
+    config["target_token_index"] = target_token_index # useful for inference/metrics
+
+    # Split data indices for train/validation
+    num_total_samples = len(input_texts)
+    indices = np.arange(num_total_samples)
+    
+    rng = np.random.default_rng(config.get("seed", 42))
+    rng.shuffle(indices) # Shuffle indices for reproducible split
+
+    n_val = int(num_total_samples * val_ratio)
+    train_indices = indices[n_val:]
+    val_indices = indices[:n_val]
+    
+    if split == "train":
+        current_indices = train_indices
+    elif split == "val":
+        current_indices = val_indices
+    else:
+        raise ValueError(f"Unknown split: {split}. Expected 'train' or 'val'.")
+
+    # Filter texts based on split indices
+    current_input_texts = [input_texts[i] for i in current_indices]
+    current_target_texts = [target_texts[i] for i in current_indices]
+
+    return Seq2SeqSequence(
+        current_input_texts, current_target_texts,
+        input_token_index, target_token_index,
+        num_encoder_tokens, num_decoder_tokens,
+        max_encoder_seq_length, max_decoder_seq_length,
+        batch_size,
+    )
+
+
+def train_step(
+    model: keras.Model,
+    batch: tuple,
+    optimizer: keras.optimizers.Optimizer,
+    config: dict,
+) -> tf.Tensor:
+    """
+    Performs one forward pass and returns the raw loss tensor.
+    The FL runtime handles gradient computation (via tf.GradientTape) and
+    optimizer updates (via optimizer.apply_gradients) externally.
+    """
+    # Keras models automatically handle device placement if a GPU is available.
+    inputs, targets = batch
+    
+    # The FL runtime is expected to have called `model.compile` with a loss function
+    # before `train_step` is invoked. `model.compiled_loss` calculates the loss
+    # using the configured loss function.
+    predictions = model(inputs, training=True)
+    loss = model.compiled_loss(targets, predictions)
+    
+    return loss

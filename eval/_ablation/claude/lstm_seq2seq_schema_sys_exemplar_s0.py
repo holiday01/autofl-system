@@ -1,0 +1,340 @@
+"""
+Auto-generated FL client module.
+Original script: character-level seq2seq translation (Keras → PyTorch conversion).
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+
+KERAS → PYTORCH CONVERSION NOTES:
+  - encoder keras.layers.LSTM(latent_dim, return_state=True)
+      → nn.LSTM(input_size=num_encoder_tokens, hidden_size=latent_dim, batch_first=True)
+  - decoder keras.layers.LSTM(latent_dim, return_sequences=True, return_state=True)
+      → nn.LSTM(input_size=num_decoder_tokens, hidden_size=latent_dim, batch_first=True)
+  - keras.layers.Dense(num_decoder_tokens, activation="softmax")
+      → nn.Linear(latent_dim, num_decoder_tokens)  [softmax folded into cross_entropy]
+  - keras categorical_crossentropy on one-hot targets
+      → F.cross_entropy on argmax-derived class indices (equivalent for hard one-hot labels)
+"""
+
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+from pathlib import Path
+
+
+# ── Model ────────────────────────────────────────────────────────────────────
+
+class Seq2SeqLSTM(nn.Module):
+    """
+    Character-level encoder-decoder LSTM with teacher forcing.
+
+    Equivalent to the Keras model in the original script:
+      encoder: LSTM(latent_dim, return_state=True)
+      decoder: LSTM(latent_dim, return_sequences=True, return_state=True)
+               → Dense(num_decoder_tokens, activation='softmax')
+
+    forward() is the teacher-forcing training path:
+        inputs  : encoder_input (B, enc_len, num_encoder_tokens)
+                  decoder_input (B, dec_len, num_decoder_tokens)
+        returns : logits         (B, dec_len, num_decoder_tokens)  [pre-softmax]
+    """
+
+    def __init__(
+        self,
+        num_encoder_tokens: int = 71,
+        num_decoder_tokens: int = 93,
+        latent_dim: int = 256,
+    ):
+        super().__init__()
+        self.num_encoder_tokens = num_encoder_tokens
+        self.num_decoder_tokens = num_decoder_tokens
+        self.latent_dim = latent_dim
+
+        # Encoder LSTM — we keep only the final hidden/cell states
+        self.encoder_lstm = nn.LSTM(
+            input_size=num_encoder_tokens,
+            hidden_size=latent_dim,
+            batch_first=True,
+        )
+
+        # Decoder LSTM — returns full sequence, seeded with encoder states
+        self.decoder_lstm = nn.LSTM(
+            input_size=num_decoder_tokens,
+            hidden_size=latent_dim,
+            batch_first=True,
+        )
+
+        # Dense projection (softmax is implicit in the loss)
+        self.decoder_dense = nn.Linear(latent_dim, num_decoder_tokens)
+
+    def forward(
+        self,
+        encoder_input: torch.Tensor,
+        decoder_input: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Teacher-forcing forward pass.
+
+        Args:
+            encoder_input : (B, enc_seq_len, num_encoder_tokens)  one-hot floats
+            decoder_input : (B, dec_seq_len, num_decoder_tokens)  one-hot floats
+        Returns:
+            logits        : (B, dec_seq_len, num_decoder_tokens)
+        """
+        # Encode — discard sequence outputs, keep final (h, c)
+        _, (h, c) = self.encoder_lstm(encoder_input)
+
+        # Decode — full sequence, initialised from encoder state
+        decoder_out, _ = self.decoder_lstm(decoder_input, (h, c))
+
+        # Project to vocabulary space (logits, no softmax)
+        logits = self.decoder_dense(decoder_out)
+        return logits
+
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+
+class CharSeq2SeqDataset(Dataset):
+    """
+    Loads and one-hot-vectorises a tab-separated translation file
+    (same format as the Anki fra-eng corpus used in the original script).
+
+    Each line is expected to be:  English<TAB>Target<TAB>attribution
+
+    Returns tuples of:
+        encoder_input  : (enc_seq_len, num_encoder_tokens)
+        decoder_input  : (dec_seq_len, num_decoder_tokens)
+        decoder_target : (dec_seq_len, num_decoder_tokens)
+    """
+
+    def __init__(self, data_path: str, num_samples: int = 10000):
+        input_texts, target_texts = [], []
+        input_characters: set = set()
+        target_characters: set = set()
+
+        with open(data_path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+
+        for line in lines[: min(num_samples, len(lines) - 1)]:
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            input_text = parts[0]
+            target_text = "\t" + parts[1] + "\n"   # "\t" = SOS, "\n" = EOS
+            input_texts.append(input_text)
+            target_texts.append(target_text)
+            input_characters.update(input_text)
+            target_characters.update(target_text)
+
+        input_characters  = sorted(input_characters)
+        target_characters = sorted(target_characters)
+        input_token_index  = {c: i for i, c in enumerate(input_characters)}
+        target_token_index = {c: i for i, c in enumerate(target_characters)}
+
+        num_enc = len(input_characters)
+        num_dec = len(target_characters)
+        max_enc = max(len(t) for t in input_texts)
+        max_dec = max(len(t) for t in target_texts)
+
+        enc_data = np.zeros((len(input_texts), max_enc, num_enc), dtype="float32")
+        dec_in   = np.zeros((len(input_texts), max_dec, num_dec), dtype="float32")
+        dec_out  = np.zeros((len(input_texts), max_dec, num_dec), dtype="float32")
+
+        space_enc = input_token_index.get(" ", 0)
+        space_dec = target_token_index.get(" ", 0)
+
+        for i, (inp, tgt) in enumerate(zip(input_texts, target_texts)):
+            t = 0
+            for t, ch in enumerate(inp):
+                enc_data[i, t, input_token_index[ch]] = 1.0
+            enc_data[i, t + 1:, space_enc] = 1.0
+            for t, ch in enumerate(tgt):
+                dec_in[i, t, target_token_index[ch]] = 1.0
+                if t > 0:
+                    dec_out[i, t - 1, target_token_index[ch]] = 1.0
+            dec_in[i, t + 1:, space_dec]  = 1.0
+            dec_out[i, t:,    space_dec]   = 1.0
+
+        self.encoder_input_data  = torch.tensor(enc_data)
+        self.decoder_input_data  = torch.tensor(dec_in)
+        self.decoder_target_data = torch.tensor(dec_out)
+
+        # Expose vocab sizes so build_model can auto-detect them if needed
+        self.num_encoder_tokens = num_enc
+        self.num_decoder_tokens = num_dec
+
+    def __len__(self) -> int:
+        return len(self.encoder_input_data)
+
+    def __getitem__(self, idx):
+        return (
+            self.encoder_input_data[idx],
+            self.decoder_input_data[idx],
+            self.decoder_target_data[idx],
+        )
+
+
+class SyntheticSeq2SeqDataset(Dataset):
+    """
+    Synthetic one-hot dataset for smoke-testing the FL pipeline.
+    Only instantiated when config['allow_synthetic_data'] is True.
+    """
+
+    def __init__(
+        self,
+        n: int = 200,
+        max_enc_len: int = 20,
+        max_dec_len: int = 25,
+        num_encoder_tokens: int = 71,
+        num_decoder_tokens: int = 93,
+    ):
+        # Build one-hot tensors via scatter for efficiency
+        enc_idx    = torch.randint(0, num_encoder_tokens, (n, max_enc_len))
+        dec_in_idx = torch.randint(0, num_decoder_tokens, (n, max_dec_len))
+        dec_out_idx= torch.randint(0, num_decoder_tokens, (n, max_dec_len))
+
+        self.enc     = torch.zeros(n, max_enc_len, num_encoder_tokens).scatter_(
+                           2, enc_idx.unsqueeze(-1), 1.0)
+        self.dec_in  = torch.zeros(n, max_dec_len, num_decoder_tokens).scatter_(
+                           2, dec_in_idx.unsqueeze(-1), 1.0)
+        self.dec_out = torch.zeros(n, max_dec_len, num_decoder_tokens).scatter_(
+                           2, dec_out_idx.unsqueeze(-1), 1.0)
+
+    def __len__(self) -> int:
+        return len(self.enc)
+
+    def __getitem__(self, idx):
+        return self.enc[idx], self.dec_in[idx], self.dec_out[idx]
+
+
+# ── FL Interface ──────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """Instantiate and return the Seq2SeqLSTM model."""
+    kwargs = config.get("model_kwargs", {})
+    return Seq2SeqLSTM(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for 'train' or 'val'.
+
+    Config keys consumed:
+      local.batch_size   (default 16)
+      local.num_workers  (default 2)
+      local.pin_memory   (default True)
+      data_path          path to the fra.txt file OR its parent directory
+      num_samples        max lines to load (default 10 000)
+      val_ratio          fraction held out for val (default 0.1)
+      seed               random_split seed (default 42)
+      allow_synthetic_data  must be True to use synthetic fallback
+      synthetic_kwargs   forwarded to SyntheticSeq2SeqDataset (optional)
+    """
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size",  config.get("batch_size",  16))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory",  True)
+
+    data_path   = config.get("data_path", ".")
+    num_samples = config.get("num_samples", 10000)
+
+    # Accept either a direct path to fra.txt or a parent directory
+    if os.path.isfile(data_path):
+        data_file = data_path
+    else:
+        data_file = os.path.join(data_path, "fra.txt")
+
+    if os.path.isfile(data_file):
+        full_dataset = CharSeq2SeqDataset(data_path=data_file, num_samples=num_samples)
+    else:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Translation data file not found at '{data_file}'. "
+                "Provide a valid 'data_path' pointing to the fra.txt corpus, "
+                "or set config['allow_synthetic_data'] = True to use synthetic data."
+            )
+        syn_kwargs = config.get("synthetic_kwargs", {})
+        full_dataset = SyntheticSeq2SeqDataset(**syn_kwargs)
+
+    val_ratio = config.get("val_ratio", 0.1)
+    n_val     = max(1, int(len(full_dataset) * val_ratio))
+    n_train   = len(full_dataset) - n_val
+    train_ds, val_ds = random_split(
+        full_dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(config.get("seed", 42)),
+    )
+    ds = train_ds if split == "train" else val_ds
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+
+    Batch layout (from CharSeq2SeqDataset / SyntheticSeq2SeqDataset):
+      batch[0]  encoder_input  (B, enc_len, num_encoder_tokens)
+      batch[1]  decoder_input  (B, dec_len, num_decoder_tokens)
+      batch[2]  decoder_target (B, dec_len, num_decoder_tokens)  — one-hot
+
+    Dict batches are also supported with keys:
+      "encoder_input" / "enc_in"
+      "decoder_input" / "dec_in"
+      "decoder_target" / "dec_out"
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        encoder_input  = batch[0]
+        decoder_input  = batch[1]
+        decoder_target = batch[2]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        encoder_input  = batch.get("encoder_input",  batch.get("enc_in"))
+        decoder_input  = batch.get("decoder_input",  batch.get("dec_in"))
+        decoder_target = batch.get("decoder_target", batch.get("dec_out"))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    # Forward pass — returns logits (B, dec_len, num_decoder_tokens)
+    logits = model(encoder_input, decoder_input)
+
+    # decoder_target is one-hot → convert to class indices for cross_entropy
+    # This is equivalent to Keras categorical_crossentropy on hard one-hot labels.
+    targets = decoder_target.argmax(dim=-1)          # (B, dec_len)
+
+    # Flatten to (B * dec_len, vocab) vs (B * dec_len,)
+    B, dec_len, vocab_size = logits.shape
+    loss = F.cross_entropy(
+        logits.reshape(B * dec_len, vocab_size),
+        targets.reshape(B * dec_len),
+    )
+    return loss  # grad_fn attached; do NOT call .backward() or .item() here

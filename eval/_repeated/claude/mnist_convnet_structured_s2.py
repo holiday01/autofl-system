@@ -1,0 +1,176 @@
+import numpy as np
+import keras                          # kept from original script
+from keras import layers              # kept from original script
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+try:
+    import torchvision.transforms as transforms
+    from torchvision.datasets import MNIST
+    HAS_TORCHVISION = True
+except ImportError:
+    HAS_TORCHVISION = False
+
+# ---------------------------------------------------------------------------
+# Model – PyTorch equivalent of the original Keras Sequential convnet.
+#
+# Keras layout (channels-last):
+#   Conv2D(32, 3x3, relu) -> MaxPool(2x2)
+#   Conv2D(64, 3x3, relu) -> MaxPool(2x2)
+#   Flatten -> Dropout(0.5) -> Dense(10, softmax)
+#
+# Spatial trace (input 28x28):
+#   conv1 -> 26x26  |  pool -> 13x13
+#   conv2 -> 11x11  |  pool ->  5x5
+#   flatten -> 64*5*5 = 1600
+#
+# The softmax is removed; raw logits are fed to F.cross_entropy,
+# which is numerically equivalent to categorical_crossentropy + softmax.
+# ---------------------------------------------------------------------------
+
+class MNISTConvNet(nn.Module):
+    """
+    Exact PyTorch translation of the Keras Simple MNIST convnet.
+    (fchollet, 2015/06/19 – last modified 2020/04/21)
+    """
+
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.conv1   = nn.Conv2d(1,  32, kernel_size=3)
+        self.conv2   = nn.Conv2d(32, 64, kernel_size=3)
+        self.pool    = nn.MaxPool2d(2)
+        self.dropout = nn.Dropout(0.5)
+        self.fc      = nn.Linear(64 * 5 * 5, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.conv1(x))   # (B, 32, 26, 26)
+        x = self.pool(x)             # (B, 32, 13, 13)
+        x = F.relu(self.conv2(x))   # (B, 64, 11, 11)
+        x = self.pool(x)             # (B, 64,  5,  5)
+        x = torch.flatten(x, 1)     # (B, 1600)
+        x = self.dropout(x)
+        x = self.fc(x)               # (B, 10)  — raw logits
+        return x
+
+
+# ---------------------------------------------------------------------------
+# FL API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Instantiate and return MNISTConvNet.
+
+    Recognised config keys:
+        model_kwargs (dict) – forwarded as kwargs to MNISTConvNet.__init__,
+                              e.g. {"num_classes": 10}.
+    """
+    kwargs = config.get("model_kwargs", {})
+    return MNISTConvNet(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+
+    Config keys:
+        local.batch_size        (int, default 16)
+        data_path               (str, default ".")  – MNIST download root
+        allow_synthetic_data    (bool, default False)
+
+    Real data is loaded via torchvision.datasets.MNIST (download=True).
+    A 90/10 train/val split is produced with random_split (seed 42),
+    mirroring the original script's validation_split=0.1.
+
+    Synthetic fallback is ONLY activated when allow_synthetic_data=True.
+    If real data is unavailable and that flag is False, FileNotFoundError
+    is raised with a clear message.
+    """
+    batch_size     = config.get("local", {}).get("batch_size", 16)
+    data_path      = config.get("data_path", ".")
+    allow_synthetic = config.get("allow_synthetic_data", False)
+
+    # ── Real data path ───────────────────────────────────────────────────────
+    if HAS_TORCHVISION:
+        try:
+            transform = transforms.Compose([
+                transforms.ToTensor(),          # HWC uint8 -> CHW float32 / 255
+            ])
+            full_ds = MNIST(
+                root=data_path,
+                train=True,
+                download=True,
+                transform=transform,
+            )
+            n_total = len(full_ds)              # 60 000
+            n_val   = max(1, int(0.1 * n_total))
+            n_train = n_total - n_val
+            train_ds, val_ds = random_split(
+                full_ds,
+                [n_train, n_val],
+                generator=torch.Generator().manual_seed(42),
+            )
+            dataset = train_ds if split == "train" else val_ds
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=(split == "train"),
+                drop_last=False,
+            )
+        except Exception as exc:
+            if not allow_synthetic:
+                raise FileNotFoundError(
+                    f"Failed to load MNIST from '{data_path}': {exc}. "
+                    "Set config['allow_synthetic_data']=True to use a synthetic "
+                    "fallback instead."
+                ) from exc
+            # allow_synthetic=True → fall through to synthetic block below
+    else:
+        if not allow_synthetic:
+            raise FileNotFoundError(
+                "torchvision is not installed; the real MNIST dataset cannot be "
+                "loaded. Install torchvision, or set config['allow_synthetic_data']"
+                "=True to use a synthetic fallback."
+            )
+        # allow_synthetic=True → fall through to synthetic block below
+
+    # ── Synthetic fallback ── only reached when allow_synthetic_data=True ────
+    n_samples = 500 if split == "train" else 100
+    x_syn = torch.randn(n_samples, 1, 28, 28)           # float32, ~N(0,1)
+    y_syn = torch.randint(0, 10, (n_samples,))           # long labels 0–9
+    return DataLoader(
+        TensorDataset(x_syn, y_syn),
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        drop_last=False,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer,          # noqa: F841  (owned by FL runtime)
+    config: dict,
+) -> torch.Tensor:
+    """
+    Single forward pass.  Returns the scalar loss tensor with grad attached.
+
+    Constraints (FL runtime contract):
+        • Does NOT call loss.backward().
+        • Does NOT call optimizer.step().
+        • Tensors are moved to the device of the model's first parameter.
+
+    Loss: F.cross_entropy (≡ categorical_crossentropy + log-softmax),
+          matching the original model.compile(loss="categorical_crossentropy").
+    """
+    device = next(model.parameters()).device
+    images, labels = batch
+    images = images.to(device)   # (B, 1, 28, 28)  float32
+    labels = labels.to(device)   # (B,)             long
+
+    logits = model(images)                    # (B, 10) raw logits
+    loss   = F.cross_entropy(logits, labels)  # scalar, grad attached
+    return loss

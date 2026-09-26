@@ -1,0 +1,242 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: keras_char_seq2seq_train.py
+
+Exposes:
+  build_model(config)               -> keras.Model
+  build_dataloader(config, split)   -> tf.data.Dataset
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import numpy as np
+import keras
+import os
+import tensorflow as tf
+from pathlib import Path
+
+
+class CharacterTranslationDataset:
+    """
+    Loads and preprocesses data for character-level sequence-to-sequence model.
+    Derives vocabulary and sequence lengths from the loaded data.
+    Assumes `fra.txt` is available at `data_path` or within it.
+    """
+
+    def __init__(self, data_path: str, num_samples: int = 10000):
+        self.input_texts = []
+        self.target_texts = []
+        self.input_characters = set()
+        self.target_characters = set()
+
+        # In an FL context, `data_path` is typically pre-configured
+        # and assumes data is already present, not downloaded.
+        data_file = None
+        if Path(data_path).is_file() and Path(data_path).name == "fra.txt":
+            data_file = data_path
+        elif Path(data_path).is_dir() and (Path(data_path) / "fra.txt").exists():
+            data_file = str(Path(data_path) / "fra.txt")
+        else:
+            raise FileNotFoundError(
+                f"Data file 'fra.txt' not found. Please ensure 'fra.txt' is available "
+                f"at '{data_path}' or in a subdirectory if '{data_path}' is a directory."
+            )
+
+        with open(data_file, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+
+        for line in lines[: min(num_samples, len(lines) - 1)]:
+            input_text, target_text, _ = line.split("\t")
+            # We use "tab" as the "start sequence" character
+            # for the targets, and "\n" as "end sequence" character.
+            target_text = "\t" + target_text + "\n"
+            self.input_texts.append(input_text)
+            self.target_texts.append(target_text)
+            for char in input_text:
+                self.input_characters.add(char)
+            for char in target_text:
+                self.target_characters.add(char)
+
+        self.input_characters = sorted(list(self.input_characters))
+        self.target_characters = sorted(list(self.target_characters))
+        self.num_encoder_tokens = len(self.input_characters)
+        self.num_decoder_tokens = len(self.target_characters)
+        self.max_encoder_seq_length = max([len(txt) for txt in self.input_texts])
+        self.max_decoder_seq_length = max([len(txt) for txt in self.target_texts])
+
+        self.input_token_index = dict([(char, i) for i, char in enumerate(self.input_characters)])
+        self.target_token_index = dict([(char, i) for i, char in enumerate(self.target_characters)])
+
+        # Determine index for space character for padding, if it exists in vocabulary
+        pad_input_char_idx = self.input_token_index.get(" ", -1)
+        pad_target_char_idx = self.target_token_index.get(" ", -1)
+
+        self.encoder_input_data = np.zeros(
+            (len(self.input_texts), self.max_encoder_seq_length, self.num_encoder_tokens),
+            dtype="float32",
+        )
+        self.decoder_input_data = np.zeros(
+            (len(self.input_texts), self.max_decoder_seq_length, self.num_decoder_tokens),
+            dtype="float32",
+        )
+        self.decoder_target_data = np.zeros(
+            (len(self.input_texts), self.max_decoder_seq_length, self.num_decoder_tokens),
+            dtype="float32",
+        )
+
+        for i, (input_text, target_text) in enumerate(zip(self.input_texts, self.target_texts)):
+            for t, char in enumerate(input_text):
+                self.encoder_input_data[i, t, self.input_token_index[char]] = 1.0
+            # Pad the rest of the encoder input sequence with spaces if ' ' is in vocab
+            if pad_input_char_idx != -1 and t + 1 < self.max_encoder_seq_length:
+                 self.encoder_input_data[i, t + 1 :, pad_input_char_idx] = 1.0
+
+            for t, char in enumerate(target_text):
+                # decoder_target_data is ahead of decoder_input_data by one timestep
+                self.decoder_input_data[i, t, self.target_token_index[char]] = 1.0
+                if t > 0:
+                    self.decoder_target_data[i, t - 1, self.target_token_index[char]] = 1.0
+            # Pad the rest of the decoder input sequence with spaces
+            if pad_target_char_idx != -1 and t + 1 < self.max_decoder_seq_length:
+                self.decoder_input_data[i, t + 1 :, pad_target_char_idx] = 1.0
+            # Pad the rest of the decoder target sequence with spaces (from current 't' onwards)
+            if pad_target_char_idx != -1 and t < self.max_decoder_seq_length - 1:
+                self.decoder_target_data[i, t:, pad_target_char_idx] = 1.0
+
+
+    def __len__(self):
+        return len(self.input_texts)
+
+    def get_data(self):
+        return ([self.encoder_input_data, self.decoder_input_data], self.decoder_target_data)
+
+    def get_metadata(self):
+        return {
+            "num_encoder_tokens": self.num_encoder_tokens,
+            "num_decoder_tokens": self.num_decoder_tokens,
+            "max_encoder_seq_length": self.max_encoder_seq_length,
+            "max_decoder_seq_length": self.max_decoder_seq_length,
+            # input_characters, target_characters, input_token_index, target_token_index
+            # are typically not passed to model_kwargs, but might be useful elsewhere.
+        }
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    kwargs = config.get("model_kwargs", {})
+    latent_dim = kwargs.get("latent_dim", 256)
+    num_encoder_tokens = kwargs.get("num_encoder_tokens")
+    num_decoder_tokens = kwargs.get("num_decoder_tokens")
+
+    if num_encoder_tokens is None or num_decoder_tokens is None:
+        raise ValueError(
+            "num_encoder_tokens and num_decoder_tokens must be provided in config['model_kwargs']. "
+            "These are typically derived from dataset metadata during a preliminary setup phase "
+            "and passed down from the FL orchestrator."
+        )
+
+    # Define an input sequence and process it.
+    encoder_inputs = keras.Input(shape=(None, num_encoder_tokens), name="encoder_inputs")
+    encoder = keras.layers.LSTM(latent_dim, return_state=True, name="encoder_lstm")
+    encoder_outputs, state_h, state_c = encoder(encoder_inputs)
+
+    # We discard `encoder_outputs` and only keep the states.
+    encoder_states = [state_h, state_c]
+
+    # Set up the decoder, using `encoder_states` as initial state.
+    decoder_inputs = keras.Input(shape=(None, num_decoder_tokens), name="decoder_inputs")
+
+    # We set up our decoder to return full output sequences,
+    # and to return internal states as well. We don't use the
+    # return states in the training model, but we will use them in inference.
+    decoder_lstm = keras.layers.LSTM(latent_dim, return_sequences=True, return_state=True, name="decoder_lstm")
+    decoder_outputs, _, _ = decoder_lstm(decoder_inputs, initial_state=encoder_states)
+    decoder_dense = keras.layers.Dense(num_decoder_tokens, activation="softmax", name="decoder_dense")
+    decoder_outputs = decoder_dense(decoder_outputs)
+
+    # Define the model that will turn
+    # `encoder_input_data` & `decoder_input_data` into `decoder_target_data`
+    model = keras.Model([encoder_inputs, decoder_inputs], decoder_outputs, name="seq2seq_model")
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> tf.data.Dataset:
+    local_config = config.get("local", {})
+    batch_size = local_config.get("batch_size", config.get("batch_size", 64))
+    num_samples = config.get("num_samples", 10000)
+    data_path = config.get("data_path", ".")
+    val_ratio = config.get("val_ratio", 0.2)
+    seed = config.get("seed", 42)
+
+    # The CharacterTranslationDataset will handle data loading and preprocessing.
+    dataset_obj = CharacterTranslationDataset(data_path, num_samples)
+    (encoder_input_data, decoder_input_data), decoder_target_data = dataset_obj.get_data()
+
+    # In a typical FL workflow, dataset metadata (like vocab sizes) is often
+    # communicated to the orchestrator and then passed to build_model.
+    # For this conversion, we update the config's model_kwargs with derived metadata.
+    if "model_kwargs" not in config:
+        config["model_kwargs"] = {}
+    config["model_kwargs"].update(dataset_obj.get_metadata())
+
+    total_samples = len(dataset_obj)
+    num_val_samples = max(1, int(total_samples * val_ratio))
+    num_train_samples = total_samples - num_val_samples
+
+    # Create a tf.data.Dataset from numpy arrays
+    # `x` is a tuple of (encoder_inputs, decoder_inputs)
+    # `y` is decoder_target_data
+    full_dataset = tf.data.Dataset.from_tensor_slices(
+        ( (encoder_input_data, decoder_input_data), decoder_target_data )
+    )
+
+    if split == "train":
+        ds = full_dataset.skip(num_val_samples)
+        ds = ds.shuffle(buffer_size=min(1024, num_train_samples), seed=seed)
+    elif split == "val":
+        ds = full_dataset.take(num_val_samples)
+        # Validation set is typically not shuffled
+    else:
+        raise ValueError(f"Unknown split: {split}. Expected 'train' or 'val'.")
+    
+    ds = ds.batch(batch_size, drop_remainder=False)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+
+    return ds
+
+
+def train_step(
+    model: keras.Model,
+    batch: tuple | list,
+    optimizer: keras.optimizers.Optimizer, # Type hint for Keras optimizer
+    config: dict,
+) -> tf.Tensor: # Keras loss is a tf.Tensor
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    # Batch structure: ((encoder_inputs, decoder_inputs), decoder_targets)
+    (encoder_inputs, decoder_inputs), targets = batch
+
+    # Perform a forward pass. `training=True` activates layers like Dropout/BatchNorm.
+    outputs = model((encoder_inputs, decoder_inputs), training=True)
+
+    # Instantiate the loss function. The original script uses 'categorical_crossentropy'.
+    loss_fn = keras.losses.CategoricalCrossentropy()
+    
+    # Compute the loss. Keras loss functions usually take (y_true, y_pred).
+    loss = loss_fn(targets, outputs)
+    
+    # Return the raw loss tensor. The FL runtime will handle gradient computation
+    # (using tf.GradientTape for Keras/TensorFlow models) and optimizer application.
+    return loss
+```

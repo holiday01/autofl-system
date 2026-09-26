@@ -1,0 +1,290 @@
+"""
+Auto-generated FL client module.
+Original script: character_level_seq2seq.py
+
+Exposes:
+  build_model(config)               -> keras.Model
+  build_dataloader(config, split)   -> keras.utils.Sequence
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import numpy as np
+import keras
+import os
+from pathlib import Path
+import tensorflow as tf # Keras now depends on TensorFlow
+
+# --- Helper for data processing ---
+_cached_data = {} # To avoid reprocessing on multiple calls
+
+def _prepare_seq2seq_data(num_samples: int = 10000):
+    """
+    Downloads, unpacks, and vectorizes the English-French character-level
+    sequence data into numpy arrays. Caches the result to avoid redundant work.
+    """
+    # keras.utils.get_file downloads to a default cache_dir (~/.keras/datasets/)
+    fpath = keras.utils.get_file(origin="http://www.manythings.org/anki/fra-eng.zip")
+    dirpath = Path(fpath).parent.absolute()
+    
+    # The actual .txt file after extraction will be 'fra.txt' inside `dirpath`
+    actual_data_file_path = os.path.join(dirpath, "fra.txt")
+
+    if actual_data_file_path in _cached_data:
+        return _cached_data[actual_data_file_path]
+
+    # Unpack if not already unpacked
+    if not os.path.exists(actual_data_file_path):
+        os.system(f"unzip -q {fpath} -d {dirpath}")
+    
+    input_texts = []
+    target_texts = []
+    input_characters = set()
+    target_characters = set()
+
+    with open(actual_data_file_path, "r", encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    
+    for line in lines[: min(num_samples, len(lines) - 1)]:
+        input_text, target_text, _ = line.split("\t")
+        target_text = "\t" + target_text + "\n" # Add start/end tokens
+        input_texts.append(input_text)
+        target_texts.append(target_text)
+        for char in input_text:
+            input_characters.add(char)
+        for char in target_text:
+            target_characters.add(char)
+
+    # Ensure ' ' (space) is in character sets for padding if not already.
+    input_characters.add(' ')
+    target_characters.add(' ')
+
+    input_characters = sorted(list(input_characters))
+    target_characters = sorted(list(target_characters))
+    num_encoder_tokens = len(input_characters)
+    num_decoder_tokens = len(target_characters)
+    max_encoder_seq_length = max([len(txt) for txt in input_texts])
+    max_decoder_seq_length = max([len(txt) for txt in target_texts])
+
+    input_token_index = dict([(char, i) for i, char in enumerate(input_characters)])
+    target_token_index = dict([(char, i) for i, char in enumerate(target_characters)])
+
+    encoder_input_data = np.zeros(
+        (len(input_texts), max_encoder_seq_length, num_encoder_tokens),
+        dtype="float32",
+    )
+    decoder_input_data = np.zeros(
+        (len(input_texts), max_decoder_seq_length, num_decoder_tokens),
+        dtype="float32",
+    )
+    decoder_target_data = np.zeros(
+        (len(input_texts), max_decoder_seq_length, num_decoder_tokens),
+        dtype="float32",
+    )
+
+    space_input_idx = input_token_index[" "]
+    space_target_idx = target_token_index[" "]
+
+    for i, (input_text, target_text) in enumerate(zip(input_texts, target_texts)):
+        for t_idx, char in enumerate(input_text):
+            encoder_input_data[i, t_idx, input_token_index[char]] = 1.0
+        # Pad remaining encoder sequence length with spaces
+        encoder_input_data[i, len(input_text):, space_input_idx] = 1.0
+
+        for t_idx, char in enumerate(target_text):
+            decoder_input_data[i, t_idx, target_token_index[char]] = 1.0
+            if t_idx > 0: # decoder_target_data is ahead by one timestep, doesn't include start char
+                decoder_target_data[i, t_idx - 1, target_token_index[char]] = 1.0
+        
+        # Pad remaining decoder input sequence length with spaces
+        decoder_input_data[i, len(target_text):, space_target_idx] = 1.0
+        # Pad remaining decoder target sequence length with spaces (from the last character onwards)
+        decoder_target_data[i, len(target_text) - 1:, space_target_idx] = 1.0
+
+    result = {
+        "encoder_input_data": encoder_input_data,
+        "decoder_input_data": decoder_input_data,
+        "decoder_target_data": decoder_target_data,
+        "num_encoder_tokens": num_encoder_tokens,
+        "num_decoder_tokens": num_decoder_tokens,
+        "max_encoder_seq_length": max_encoder_seq_length,
+        "max_decoder_seq_length": max_decoder_seq_length,
+        "input_token_index": input_token_index,
+        "target_token_index": target_token_index,
+        "input_characters": input_characters,
+        "target_characters": target_characters,
+    }
+    _cached_data[actual_data_file_path] = result
+    return result
+
+# --- Keras Sequence for DataLoader ---
+class Seq2SeqDataSequence(keras.utils.Sequence):
+    """
+    A Keras Sequence to serve batches of character-level sequence-to-sequence data.
+    """
+    def __init__(self, encoder_input_data, decoder_input_data, decoder_target_data, batch_size, shuffle=True):
+        self.encoder_input_data = encoder_input_data
+        self.decoder_input_data = decoder_input_data
+        self.decoder_target_data = decoder_target_data
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.indices = np.arange(len(self.encoder_input_data))
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+    def __len__(self):
+        return int(np.ceil(len(self.encoder_input_data) / self.batch_size))
+
+    def __getitem__(self, idx):
+        batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+        enc_in = self.encoder_input_data[batch_indices]
+        dec_in = self.decoder_input_data[batch_indices]
+        dec_tgt = self.decoder_target_data[batch_indices]
+        # Keras functional API models expect a list of inputs for multiple input layers
+        return [tf.convert_to_tensor(enc_in), tf.convert_to_tensor(dec_in)], tf.convert_to_tensor(dec_tgt)
+
+    def on_epoch_end(self):
+        """Shuffles data at the end of each epoch if shuffle is enabled."""
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    """
+    Builds the Keras character-level sequence-to-sequence model.
+
+    Args:
+        config: A dictionary containing model configuration parameters.
+                Expected keys: "latent_dim", "num_encoder_tokens", "num_decoder_tokens".
+    Returns:
+        A compiled Keras functional API model.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    # Get parameters from config; these would typically be set by a central orchestrator
+    # after initial data analysis or from a shared configuration.
+    latent_dim = model_kwargs.get("latent_dim", config.get("latent_dim", 256))
+    num_encoder_tokens = config.get("num_encoder_tokens") # Must be populated by build_dataloader
+    num_decoder_tokens = config.get("num_decoder_tokens") # Must be populated by build_dataloader
+
+    if num_encoder_tokens is None or num_decoder_tokens is None:
+        raise ValueError(
+            "num_encoder_tokens and num_decoder_tokens must be in config."
+            " Ensure build_dataloader is called first or config is pre-populated."
+        )
+
+    # Define the encoder
+    encoder_inputs = keras.Input(shape=(None, num_encoder_tokens), name="encoder_inputs")
+    encoder = keras.layers.LSTM(latent_dim, return_state=True, name="encoder_lstm")
+    encoder_outputs, state_h, state_c = encoder(encoder_inputs)
+    encoder_states = [state_h, state_c] # Discard `encoder_outputs`, keep only states.
+
+    # Define the decoder
+    decoder_inputs = keras.Input(shape=(None, num_decoder_tokens), name="decoder_inputs")
+    decoder_lstm = keras.layers.LSTM(latent_dim, return_sequences=True, return_state=True, name="decoder_lstm")
+    decoder_outputs, _, _ = decoder_lstm(decoder_inputs, initial_state=encoder_states)
+    decoder_dense = keras.layers.Dense(num_decoder_tokens, activation="softmax", name="decoder_dense")
+    decoder_outputs = decoder_dense(decoder_outputs)
+
+    # Combine encoder and decoder into a training model
+    model = keras.Model([encoder_inputs, decoder_inputs], decoder_outputs, name="seq2seq_model")
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> keras.utils.Sequence:
+    """
+    Builds a Keras Sequence DataLoader for the specified data split.
+
+    Args:
+        config: A dictionary containing data configuration parameters.
+                Expected keys: "batch_size", "num_samples", "validation_split".
+        split: The data split to create ("train" or "val").
+    Returns:
+        A keras.utils.Sequence instance.
+    """
+    local_config = config.get("local", {})
+    batch_size = local_config.get("batch_size", config.get("batch_size", 64))
+    num_samples = config.get("num_samples", 10000)
+    
+    # Prepare data and get metadata
+    data = _prepare_seq2seq_data(num_samples=num_samples)
+
+    # Populate config with data schema info, crucial for `build_model`
+    config["num_encoder_tokens"] = data["num_encoder_tokens"]
+    config["num_decoder_tokens"] = data["num_decoder_tokens"]
+    config["max_encoder_seq_length"] = data["max_encoder_seq_length"]
+    config["max_decoder_seq_length"] = data["max_decoder_seq_length"]
+    config["input_token_index"] = data["input_token_index"]
+    config["target_token_index"] = data["target_token_index"]
+
+    encoder_input_data = data["encoder_input_data"]
+    decoder_input_data = data["decoder_input_data"]
+    decoder_target_data = data["decoder_target_data"]
+
+    validation_split = config.get("validation_split", 0.2)
+    num_samples_total = len(encoder_input_data)
+    num_train_samples = int(num_samples_total * (1 - validation_split))
+    
+    if split == "train":
+        start_idx = 0
+        end_idx = num_train_samples
+        shuffle_data = True # Typically shuffle training data
+    elif split == "val":
+        start_idx = num_train_samples
+        end_idx = num_samples_total
+        shuffle_data = False # Typically don't shuffle validation data
+    else:
+        raise ValueError(f"Unknown split: {split}. Expected 'train' or 'val'.")
+
+    ds = Seq2SeqDataSequence(
+        encoder_input_data[start_idx:end_idx],
+        decoder_input_data[start_idx:end_idx],
+        decoder_target_data[start_idx:end_idx],
+        batch_size=batch_size,
+        shuffle=shuffle_data
+    )
+    
+    return ds
+
+
+def train_step(
+    model: keras.Model,
+    batch: tuple | list, # Expected format: ([encoder_inputs, decoder_inputs], decoder_targets)
+    optimizer, # Keras optimizer instance. Not used directly for loss calculation, but part of FL contract.
+    config: dict,
+) -> tf.Tensor:
+    """
+    Performs ONE forward pass and returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime handles gradient computation (via tf.GradientTape) and optimizer application.
+
+    Args:
+        model: The Keras model to train.
+        batch: A tuple/list containing (inputs, targets). Inputs is a list
+               [encoder_input_batch, decoder_input_batch].
+        optimizer: The Keras optimizer instance.
+        config: A dictionary containing training configuration parameters.
+    Returns:
+        A tf.Tensor representing the calculated loss for the batch.
+    """
+    # Unpack the batch. Keras Sequence returns ([encoder_inputs, decoder_inputs], decoder_targets)
+    inputs_tuple, targets = batch
+    
+    # Forward pass through the model.
+    # `training=True` is important for layers like Dropout and BatchNorm.
+    outputs = model(inputs_tuple, training=True) 
+
+    # Calculate loss.
+    # The original script uses 'categorical_crossentropy' with a softmax activation
+    # in the last dense layer. So `from_logits=False` is correct here.
+    loss_fn = keras.losses.CategoricalCrossentropy(from_logits=False)
+    loss = loss_fn(targets, outputs)
+    
+    # Return the loss tensor. TensorFlow tensors automatically track gradients
+    # when operations are performed inside a tf.GradientTape context.
+    return loss

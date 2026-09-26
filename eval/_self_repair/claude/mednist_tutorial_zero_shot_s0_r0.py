@@ -1,0 +1,128 @@
+# Copyright (c) MONAI Consortium
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+
+import numpy as np
+import torch
+
+import monai
+from monai.data import DataLoader, ImageDataset
+from monai.transforms import Compose, EnsureChannelFirst, RandRotate90, Resize, ScaleIntensity
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    model = monai.networks.nets.DenseNet121(
+        spatial_dims=config.get("spatial_dims", 3),
+        in_channels=config.get("in_channels", 1),
+        out_channels=config.get("out_channels", 2),
+    ).to(device)
+    return model
+
+
+def build_dataloader(config: dict, split: str) -> DataLoader:
+    data_path = config.get(
+        "data_path",
+        os.sep.join([".", "workspace", "data", "medical", "ixi", "IXI-T1"]),
+    )
+    image_files = config.get("image_files", [
+        "IXI314-IOP-0889-T1.nii.gz",
+        "IXI249-Guys-1072-T1.nii.gz",
+        "IXI609-HH-2600-T1.nii.gz",
+        "IXI173-HH-1590-T1.nii.gz",
+        "IXI020-Guys-0700-T1.nii.gz",
+        "IXI342-Guys-0909-T1.nii.gz",
+        "IXI134-Guys-0780-T1.nii.gz",
+        "IXI577-HH-2661-T1.nii.gz",
+        "IXI066-Guys-0731-T1.nii.gz",
+        "IXI130-HH-1528-T1.nii.gz",
+        "IXI607-Guys-1097-T1.nii.gz",
+        "IXI175-HH-1570-T1.nii.gz",
+        "IXI385-HH-2078-T1.nii.gz",
+        "IXI344-Guys-0905-T1.nii.gz",
+        "IXI409-Guys-0960-T1.nii.gz",
+        "IXI584-Guys-1129-T1.nii.gz",
+        "IXI253-HH-1694-T1.nii.gz",
+        "IXI092-HH-1436-T1.nii.gz",
+        "IXI574-IOP-1156-T1.nii.gz",
+        "IXI585-Guys-1130-T1.nii.gz",
+    ])
+    labels = np.array(
+        config.get("labels", [0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+        dtype=np.int64,
+    )
+
+    images = [os.sep.join([data_path, f]) for f in image_files]
+    spatial_size = tuple(config.get("spatial_size", [96, 96, 96]))
+    batch_size = config.get("batch_size", 2)
+    num_workers = config.get("num_workers", 2)
+    train_ratio = config.get("train_ratio", 0.5)
+    split_idx = int(len(images) * train_ratio)
+
+    train_transforms = Compose([
+        ScaleIntensity(),
+        EnsureChannelFirst(),
+        Resize(spatial_size),
+        RandRotate90(),
+    ])
+    val_transforms = Compose([
+        ScaleIntensity(),
+        EnsureChannelFirst(),
+        Resize(spatial_size),
+    ])
+
+    if split == "train":
+        dataset = ImageDataset(
+            image_files=images[:split_idx],
+            labels=labels[:split_idx],
+            transform=train_transforms,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+    elif split == "val":
+        dataset = ImageDataset(
+            image_files=images[split_idx:],
+            labels=labels[split_idx:],
+            transform=val_transforms,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        raise ValueError(f"Unknown split '{split}'. Expected 'train' or 'val'.")
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch: tuple,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> float:
+    device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    loss_function = torch.nn.CrossEntropyLoss()
+
+    inputs, labels = batch[0].to(device), batch[1].to(device)
+    optimizer.zero_grad()
+    outputs = model(inputs)
+    loss = loss_function(outputs, labels)
+    loss.backward()
+    optimizer.step()
+    return loss.item()

@@ -1,0 +1,430 @@
+```python
+import os
+import time
+import requests
+import tarfile
+import numpy as np
+import argparse
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.optim import Adam
+from torch.utils.data import Dataset, DataLoader, random_split
+
+
+# ---------------------------------------------------------------------------
+# Model architecture – preserved exactly from the original script
+# ---------------------------------------------------------------------------
+
+class GraphConv(nn.Module):
+    """
+    Graph Convolutional Layer described in "Semi-Supervised Classification with Graph Convolutional Networks".
+
+    Given an input feature representation for each node in a graph, the Graph Convolutional Layer aims to aggregate
+    information from the node's neighborhood to update its own representation. This is achieved by applying a graph
+    convolutional operation that combines the features of a node with the features of its neighboring nodes.
+
+    Mathematically, the Graph Convolutional Layer can be described as follows:
+
+        H' = f(D^(-1/2) * A * D^(-1/2) * H * W)
+
+    where:
+        H: Input feature matrix with shape (N, F_in), where N is the number of nodes and F_in is the number of
+            input features per node.
+        A: Adjacency matrix of the graph with shape (N, N), representing the relationships between nodes.
+        W: Learnable weight matrix with shape (F_in, F_out), where F_out is the number of output features per node.
+        D: The degree matrix.
+    """
+    def __init__(self, input_dim, output_dim, use_bias=False):
+        super(GraphConv, self).__init__()
+
+        self.kernel = nn.Parameter(torch.Tensor(input_dim, output_dim))
+        nn.init.xavier_normal_(self.kernel)
+
+        self.bias = None
+        if use_bias:
+            self.bias = nn.Parameter(torch.Tensor(output_dim))
+            nn.init.zeros_(self.bias)
+
+    def forward(self, input_tensor, adj_mat):
+        """
+        Performs a graph convolution operation.
+
+        Args:
+            input_tensor (torch.Tensor): Input tensor representing node features.
+            adj_mat (torch.Tensor): Normalized adjacency matrix representing graph structure.
+
+        Returns:
+            torch.Tensor: Output tensor after the graph convolution operation.
+        """
+        support = torch.mm(input_tensor, self.kernel)
+        output = torch.spmm(adj_mat, support)
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+
+
+class GCN(nn.Module):
+    """
+    Graph Convolutional Network (GCN) as described in the paper `"Semi-Supervised Classification with Graph
+    Convolutional Networks" <https://arxiv.org/pdf/1609.02907.pdf>`.
+
+    The Graph Convolutional Network is a deep learning architecture designed for semi-supervised node
+    classification tasks on graph-structured data. It leverages the graph structure to learn node representations
+    by propagating information through the graph using graph convolutional layers.
+
+    The original implementation consists of two stacked graph convolutional layers. The ReLU activation function is
+    applied to the hidden representations, and the Softmax activation function is applied to the output representations.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim, use_bias=True, dropout_p=0.1):
+        super(GCN, self).__init__()
+
+        self.gc1 = GraphConv(input_dim, hidden_dim, use_bias=use_bias)
+        self.gc2 = GraphConv(hidden_dim, output_dim, use_bias=use_bias)
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, input_tensor, adj_mat):
+        """
+        Performs forward pass of the Graph Convolutional Network (GCN).
+
+        Args:
+            input_tensor (torch.Tensor): Input node feature matrix with shape (N, input_dim).
+            adj_mat (torch.Tensor): Normalized adjacency matrix of the graph with shape (N, N).
+
+        Returns:
+            torch.Tensor: Output tensor with shape (N, output_dim), representing the predicted class
+                          probabilities for each node.
+        """
+        x = self.gc1(input_tensor, adj_mat)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.gc2(x, adj_mat)
+        return F.log_softmax(x, dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Original data-loading helper – preserved exactly
+# ---------------------------------------------------------------------------
+
+def load_cora(path='./cora', device='cpu'):
+    """
+    The graph convolutional operation requires the normalized adjacency matrix: D^(-1/2) * A * D^(-1/2).
+    """
+    content_path = os.path.join(path, 'cora.content')
+    cites_path = os.path.join(path, 'cora.cites')
+
+    content_tensor = np.genfromtxt(content_path, dtype=np.dtype(str))
+    cites_tensor = np.genfromtxt(cites_path, dtype=np.int32)
+
+    features = torch.FloatTensor(content_tensor[:, 1:-1].astype(np.int32))
+    scale_vector = torch.sum(features, dim=1)
+    scale_vector = 1 / scale_vector
+    scale_vector[scale_vector == float('inf')] = 0
+    scale_vector = torch.diag(scale_vector).to_sparse()
+    features = scale_vector @ features
+
+    classes, labels = np.unique(content_tensor[:, -1], return_inverse=True)
+    labels = torch.LongTensor(labels)
+
+    idx = content_tensor[:, 0].astype(np.int32)
+    idx_map = {id: pos for pos, id in enumerate(idx)}
+
+    edges = np.array(
+        list(map(lambda edge: [idx_map[edge[0]], idx_map[edge[1]]],
+            cites_tensor)), dtype=np.int32)
+
+    V = len(idx)
+    E = edges.shape[0]
+    adj_mat = torch.sparse_coo_tensor(edges.T, torch.ones(E), (V, V), dtype=torch.int64)
+    adj_mat = torch.eye(V) + adj_mat
+
+    degree_mat = torch.sum(adj_mat, dim=1)
+    degree_mat = torch.sqrt(1 / degree_mat)
+    degree_mat[degree_mat == float('inf')] = 0
+    degree_mat = torch.diag(degree_mat).to_sparse()
+
+    adj_mat = degree_mat @ adj_mat @ degree_mat
+
+    return features.to_sparse().to(device), labels.to(device), adj_mat.to_sparse().to(device)
+
+
+# ---------------------------------------------------------------------------
+# Original evaluation helpers – preserved exactly
+# ---------------------------------------------------------------------------
+
+def train_iter(epoch, model, optimizer, criterion, input, target, mask_train, mask_val, print_every=10):
+    start_t = time.time()
+    model.train()
+    optimizer.zero_grad()
+
+    output = model(*input)
+    loss = criterion(output[mask_train], target[mask_train])
+
+    loss.backward()
+    optimizer.step()
+
+    loss_train, acc_train = test(model, criterion, input, target, mask_train)
+    loss_val, acc_val = test(model, criterion, input, target, mask_val)
+
+    if epoch % print_every == 0:
+        print(f'Epoch: {epoch:04d} ({(time.time() - start_t):.4f}s) loss_train: {loss_train:.4f} '
+              f'acc_train: {acc_train:.4f} loss_val: {loss_val:.4f} acc_val: {acc_val:.4f}')
+
+
+def test(model, criterion, input, target, mask):
+    model.eval()
+    with torch.no_grad():
+        output = model(*input)
+        output, target = output[mask], target[mask]
+
+        loss = criterion(output, target)
+        acc = (output.argmax(dim=1) == target).float().sum() / len(target)
+    return loss.item(), acc.item()
+
+
+# ---------------------------------------------------------------------------
+# Dataset wrapper for transductive GCN
+# ---------------------------------------------------------------------------
+
+class _CoraNodeDataset(Dataset):
+    """
+    Wraps the Cora graph for FL-compatible transductive GCN training.
+
+    GCN is inherently transductive: it must see the *entire* graph during
+    every forward pass, but the loss is computed only on a subset of nodes.
+    This dataset stores the full graph and exposes individual node indices as
+    items.  The paired ``collate_fn`` assembles each DataLoader batch into a
+    tuple of (full-graph features, full-graph adj, all labels, batch-node mask)
+    so that ``train_step`` can run a complete forward pass and restrict the
+    NLLLoss to the masked nodes.
+
+    Tensors are stored as dense internally for pickling safety and converted
+    back to sparse COO in ``collate_fn``, which is what GraphConv.forward
+    expects (``torch.mm`` sparse×dense and ``torch.spmm`` sparse×dense).
+    """
+
+    def __init__(
+        self,
+        features: torch.Tensor,
+        adj_mat: torch.Tensor,
+        labels: torch.Tensor,
+        node_indices: torch.Tensor,
+    ):
+        self.features = features.to_dense() if features.is_sparse else features
+        self.adj_mat = adj_mat.to_dense() if adj_mat.is_sparse else adj_mat
+        self.labels = labels
+        self.node_indices = (
+            node_indices
+            if isinstance(node_indices, torch.Tensor)
+            else torch.tensor(node_indices, dtype=torch.long)
+        )
+
+    def __len__(self) -> int:
+        return len(self.node_indices)
+
+    def __getitem__(self, idx) -> torch.Tensor:
+        return self.node_indices[idx]
+
+    def collate_fn(self, batch: list) -> tuple:
+        """
+        Collate a list of node-index scalars into a full-graph batch.
+
+        Returns:
+            features  – sparse COO FloatTensor  (N, F)
+            adj_mat   – sparse COO FloatTensor  (N, N)
+            labels    – LongTensor              (N,)
+            mask      – LongTensor              (batch_size,)  node indices
+        """
+        mask = torch.stack(batch)
+        return (
+            self.features.to_sparse().coalesce(),
+            self.adj_mat.to_sparse().coalesce(),
+            self.labels,
+            mask,
+        )
+
+
+# ---------------------------------------------------------------------------
+# FL API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """
+    Instantiate and return a GCN.
+
+    Reads constructor arguments from config.get("model_kwargs", {}).
+    Supported keys and their defaults:
+        input_dim  (int)   – number of node features          [1433, Cora default]
+        hidden_dim (int)   – hidden representation size       [16]
+        output_dim (int)   – number of classes                [7, Cora default]
+        use_bias   (bool)  – add bias terms in GraphConv      [True]
+        dropout_p  (float) – dropout probability              [0.5]
+    """
+    kwargs = config.get("model_kwargs", {})
+    return GCN(
+        input_dim=kwargs.get("input_dim", 1433),
+        hidden_dim=kwargs.get("hidden_dim", 16),
+        output_dim=kwargs.get("output_dim", 7),
+        use_bias=kwargs.get("use_bias", True),
+        dropout_p=kwargs.get("dropout_p", 0.5),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the Cora citation-graph dataset.
+
+    Each batch is a tuple:
+        (features, adj_mat, labels, mask)
+    where ``features`` and ``adj_mat`` are the *full* graph as sparse COO
+    tensors, ``labels`` contains class indices for all N nodes, and ``mask``
+    is a LongTensor of the node indices that belong to this mini-batch.
+    ``train_step`` uses this mask to restrict the NLLLoss to the current nodes
+    while still propagating gradients through the full-graph forward pass.
+
+    Config keys consumed:
+        local.batch_size        (int)   – nodes per batch          [16]
+        data_path               (str)   – directory containing the
+                                          ``cora/`` sub-folder     ["."]
+        seed                    (int)   – RNG seed for random_split [42]
+        allow_synthetic_data    (bool)  – if True and real data is
+                                          absent, fall back to a
+                                          random Cora-shaped graph  [False]
+
+    The train/val split (80 / 20) is produced with ``random_split`` over all
+    node indices, seeded deterministically so that repeated calls for "train"
+    and "val" yield consistent, non-overlapping subsets.
+
+    Raises:
+        FileNotFoundError – when the real dataset is absent and
+                            allow_synthetic_data is False.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    cora_path = os.path.join(data_path, "cora")
+    seed = config.get("seed", 42)
+
+    content_file = os.path.join(cora_path, "cora.content")
+    real_data_available = os.path.isfile(content_file)
+
+    if real_data_available:
+        features, labels, adj_mat = load_cora(path=cora_path, device="cpu")
+        # Store as dense; collate_fn will re-sparsify for GraphConv
+        features = features.to_dense()
+        adj_mat = adj_mat.to_dense()
+    else:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Cora dataset not found at '{cora_path}' "
+                f"(expected '{content_file}'). "
+                "Download the dataset or set "
+                "config['allow_synthetic_data'] = True to use "
+                "a random synthetic graph for testing."
+            )
+        # Synthetic Cora-shaped graph ----------------------------------------
+        N, F_in, C = 200, 1433, 7
+        rng = torch.Generator()
+        rng.manual_seed(seed)
+        features = torch.randn(N, F_in, generator=rng)
+        labels = torch.randint(0, C, (N,), generator=rng)
+        # Build a random symmetric adjacency and apply the renorm trick
+        raw = (torch.rand(N, N, generator=rng) > 0.95).float()
+        raw = (raw + raw.t()).clamp(max=1.0)
+        adj_mat = torch.eye(N) + raw
+        degree = adj_mat.sum(dim=1).clamp(min=1e-6)
+        d_inv_sqrt = torch.diag(degree.pow(-0.5))
+        adj_mat = d_inv_sqrt @ adj_mat @ d_inv_sqrt
+        # --------------------------------------------------------------------
+
+    num_nodes = labels.shape[0]
+    all_indices = torch.arange(num_nodes, dtype=torch.long)
+
+    # Split node indices into train / val with a fixed-seed generator so that
+    # both "train" and "val" calls produce consistent, disjoint subsets.
+    full_dataset = _CoraNodeDataset(features, adj_mat, labels, all_indices)
+    val_size = max(1, int(0.2 * num_nodes))
+    train_size = num_nodes - val_size
+    split_gen = torch.Generator()
+    split_gen.manual_seed(seed)
+    train_subset, val_subset = random_split(
+        full_dataset, [train_size, val_size], generator=split_gen
+    )
+
+    # Re-wrap the chosen indices as a _CoraNodeDataset so the collate_fn
+    # retains a reference to the full graph tensors.
+    if split == "val":
+        chosen_indices = torch.tensor(val_subset.indices, dtype=torch.long)
+    else:
+        chosen_indices = torch.tensor(train_subset.indices, dtype=torch.long)
+
+    active_dataset = _CoraNodeDataset(features, adj_mat, labels, chosen_indices)
+
+    return DataLoader(
+        active_dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        collate_fn=active_dataset.collate_fn,
+        # num_workers=0: collate_fn is a bound method; multiprocessing
+        # would require it to be picklable via a top-level function.
+        num_workers=0,
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch: tuple,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    Execute a single forward pass and return the loss with gradients attached.
+
+    The FL runtime is responsible for calling ``loss.backward()`` and
+    ``optimizer.step()``.  This function must NOT call either.
+
+    Args:
+        model:     GCN instance (already on the target device).
+        batch:     4-tuple (features, adj_mat, labels, mask) from the
+                   DataLoader produced by ``build_dataloader``.
+                     features – sparse COO FloatTensor (N, F)
+                     adj_mat  – sparse COO FloatTensor (N, N)
+                     labels   – LongTensor             (N,)
+                     mask     – LongTensor             (B,)  node indices
+        optimizer: Provided by the FL runtime; unused here.
+        config:    FL configuration dict.
+
+    Returns:
+        Scalar loss tensor with ``requires_grad=True``.
+    """
+    features, adj_mat, labels, mask = batch
+
+    # Move all tensors to the device that holds the model parameters
+    device = next(model.parameters()).device
+    features = features.to(device)
+    adj_mat = adj_mat.to(device)
+    labels = labels.to(device)
+    mask = mask.to(device)
+
+    model.train()
+
+    # Full-graph forward pass; loss restricted to the batch-node mask
+    output = model(features, adj_mat)          # (N, num_classes)  log-softmax
+    loss = nn.NLLLoss()(output[mask], labels[mask])
+
+    # Return the loss — backward() and optimizer.step() are the FL runtime's job
+    return loss
+```
+
+---
+
+**Key design decisions and why they were made:**
+
+| Challenge | Decision |
+|---|---|
+| **Transductive graph** — GCN must see the *entire* graph every forward pass, not isolated rows | `_CoraNodeDataset` stores the full graph; each `__getitem__` returns a bare node index; `collate_fn` re-attaches the full graph on every batch |
+| **`random_split` requirement** — the dataset needs multiple items | Node indices are the items (one per node); `random_split` partitions them 80/20; split results are then re-wrapped in a new `_CoraNodeDataset` so the collate closure always has the full graph |
+| **Deterministic train/val** — calling `build_dataloader` twice (once `"train"`, once `"val"`) must yield consistent, non-overlapping subsets | `torch.Generator().manual_seed(seed)` passed to `random_split` in both calls |
+| **Sparse tensors** — `GraphConv` uses `torch.mm(sparse, dense)` and `torch.spmm(sparse, dense)` | Tensors stored as dense (pickling-safe); `collate_fn` converts to `.to_sparse().coalesce()` just before returning |
+| **`train_step` gradient contract** — FL runtime calls `backward()` and `optimizer.step()` | `train_step` only runs the forward pass and NLLLoss; neither `loss.backward()` nor `optimizer.step()` are called |
+| **Synthetic fallback safety** | Gated strictly on `config.get("allow_synthetic_data", False)`; if `False` and real data is absent, raises `FileNotFoundError` with a clear actionable message |

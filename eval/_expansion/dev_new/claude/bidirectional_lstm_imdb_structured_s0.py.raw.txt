@@ -1,0 +1,215 @@
+```python
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+# ── Original hyper-parameters ─────────────────────────────────────────────────
+max_features = 20000   # Only consider the top 20k words
+maxlen = 200           # Only consider the first 200 words of each movie review
+
+
+# ── Model (Keras → PyTorch) ───────────────────────────────────────────────────
+
+class BidirectionalLSTMClassifier(nn.Module):
+    """
+    PyTorch equivalent of the Keras 2-layer Bidirectional LSTM model.
+
+    Keras original:
+        Embedding(max_features, 128)
+        Bidirectional(LSTM(64, return_sequences=True))
+        Bidirectional(LSTM(64))
+        Dense(1, activation='sigmoid')
+    """
+
+    def __init__(
+        self,
+        max_features: int = 20000,
+        embed_dim: int = 128,
+        hidden_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(max_features, embed_dim, padding_idx=0)
+        # First Bidirectional LSTM — returns all timesteps (return_sequences=True)
+        self.bilstm1 = nn.LSTM(
+            embed_dim, hidden_dim,
+            num_layers=1, batch_first=True, bidirectional=True,
+        )
+        # Second Bidirectional LSTM — input size = 2 * hidden_dim (forward+backward)
+        self.bilstm2 = nn.LSTM(
+            hidden_dim * 2, hidden_dim,
+            num_layers=1, batch_first=True, bidirectional=True,
+        )
+        # Classifier: 2 * hidden_dim → 1 probability
+        self.classifier = nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x : (batch, seq_len)  — integer token ids
+        emb = self.embedding(x)          # (batch, seq, embed_dim)
+        out1, _ = self.bilstm1(emb)      # (batch, seq, 2*hidden)
+        out2, _ = self.bilstm2(out1)     # (batch, seq, 2*hidden)
+        last = out2[:, -1, :]            # (batch, 2*hidden)  — final timestep
+        logits = self.classifier(last)   # (batch, 1)
+        return torch.sigmoid(logits).squeeze(-1)  # (batch,)  values in [0, 1]
+
+
+# ── FL API ────────────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Instantiate and return the BidirectionalLSTMClassifier.
+
+    Recognised model_kwargs keys
+    ----------------------------
+    max_features : int  (default 20 000)
+    embed_dim    : int  (default 128)
+    hidden_dim   : int  (default 64)
+    """
+    kwargs = config.get("model_kwargs", {})
+    return BidirectionalLSTMClassifier(
+        max_features=kwargs.get("max_features", max_features),
+        embed_dim=kwargs.get("embed_dim", 128),
+        hidden_dim=kwargs.get("hidden_dim", 64),
+    )
+
+
+# ── Dataset helpers ───────────────────────────────────────────────────────────
+
+def _load_full_dataset(data_path: str, config: dict) -> TensorDataset:
+    """
+    Load the complete IMDB dataset (all splits merged), returning a TensorDataset.
+
+    Resolution order
+    ----------------
+    1. Local numpy files  : <data_path>/x.npy  +  <data_path>/y.npy
+    2. Keras built-in     : keras.datasets.imdb (downloads to ~/.keras if needed)
+    3. Synthetic fallback : only when config['allow_synthetic_data'] is True;
+                            raises FileNotFoundError otherwise.
+    """
+    max_feat = config.get("model_kwargs", {}).get("max_features", max_features)
+    seq_len  = config.get("model_kwargs", {}).get("maxlen", maxlen)
+
+    # ── 1. Local numpy files ─────────────────────────────────────────────────
+    x_path = os.path.join(data_path, "x.npy")
+    y_path = os.path.join(data_path, "y.npy")
+    if os.path.isfile(x_path) and os.path.isfile(y_path):
+        X = np.load(x_path)
+        Y = np.load(y_path).astype(np.float32)
+        return TensorDataset(
+            torch.tensor(X, dtype=torch.long),
+            torch.tensor(Y, dtype=torch.float32),
+        )
+
+    # ── 2. Keras IMDB (may download to ~/.keras/datasets/) ───────────────────
+    try:
+        import keras  # noqa: PLC0415
+        (x_tr, y_tr), (x_va, y_va) = keras.datasets.imdb.load_data(
+            num_words=max_feat
+        )
+        X = np.concatenate([x_tr, x_va], axis=0)
+        Y = np.concatenate([y_tr, y_va], axis=0).astype(np.float32)
+        X = keras.utils.pad_sequences(X, maxlen=seq_len)  # truncate / zero-pad
+        return TensorDataset(
+            torch.tensor(X, dtype=torch.long),
+            torch.tensor(Y, dtype=torch.float32),
+        )
+    except Exception:
+        pass
+
+    # ── 3. Synthetic fallback (opt-in only) ──────────────────────────────────
+    if not config.get("allow_synthetic_data", False):
+        raise FileNotFoundError(
+            f"IMDB dataset not found at '{data_path}' and the Keras download "
+            "failed or Keras is not installed. "
+            "Either place x.npy / y.npy in data_path, ensure Keras is installed "
+            "with internet access for the first run, or set "
+            "config['allow_synthetic_data'] = True to use synthetic data for "
+            "smoke-testing only (NOT for real training)."
+        )
+
+    n_syn = 1000
+    X_syn = torch.randint(0, max_feat, (n_syn, seq_len), dtype=torch.long)
+    Y_syn = torch.randint(0, 2,        (n_syn,),         dtype=torch.float32)
+    return TensorDataset(X_syn, Y_syn)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ('train' or 'val').
+
+    Config keys used
+    ----------------
+    config["local"]["batch_size"]  : int   (default 16)
+    config["data_path"]            : str   (default ".")
+    config["allow_synthetic_data"] : bool  (default False)
+    config["model_kwargs"]["max_features"] : int (default 20 000)
+    config["model_kwargs"]["maxlen"]       : int (default 200)
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path  = config.get("data_path", ".")
+
+    dataset = _load_full_dataset(data_path, config)
+
+    n_total = len(dataset)
+    n_val   = max(1, int(0.2 * n_total))
+    n_train = n_total - n_val
+
+    train_ds, val_ds = random_split(
+        dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen   = train_ds if split == "train" else val_ds
+    shuffled = split == "train"
+
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=shuffled,
+        drop_last=False,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple,
+    optimizer,        # owned by the FL runtime — do NOT call .step() here
+    config: dict,
+) -> torch.Tensor:
+    """
+    Run ONE forward pass and return the scalar loss tensor WITH grad attached.
+
+    Constraints
+    -----------
+    - Does NOT call loss.backward().
+    - Does NOT call optimizer.step().
+    - Tensors are moved to the device of the model parameters.
+    """
+    device = next(model.parameters()).device
+
+    x_seq, labels = batch
+    x_seq  = x_seq.to(device)    # (batch, seq_len) — long
+    labels = labels.to(device)   # (batch,)          — float32 ∈ {0, 1}
+
+    # Forward pass: model already applies sigmoid, so use binary_cross_entropy
+    probs = model(x_seq)         # (batch,)  ∈ [0, 1]
+    loss  = F.binary_cross_entropy(probs, labels)
+    return loss                  # grad is attached; FL runtime calls .backward()
+```
+
+---
+
+**Conversion notes**
+
+| Keras layer | PyTorch equivalent |
+|---|---|
+| `Embedding(20000, 128)` | `nn.Embedding(20000, 128, padding_idx=0)` |
+| `Bidirectional(LSTM(64, return_sequences=True))` | `nn.LSTM(128, 64, bidirectional=True, batch_first=True)` — full output used |
+| `Bidirectional(LSTM(64))` | `nn.LSTM(128, 64, bidirectional=True, batch_first=True)` — last timestep `out[:, -1, :]` taken |
+| `Dense(1, activation='sigmoid')` | `nn.Linear(128, 1)` + `torch.sigmoid(…).squeeze(-1)` |
+| `binary_crossentropy` loss | `F.binary_cross_entropy(probs, labels)` |
+
+**Data loading** tries (in order): local `x.npy`/`y.npy` → Keras built-in download → synthetic fallback (only when `allow_synthetic_data=True`, otherwise `FileNotFoundError`). `random_split` with a fixed seed carves out an 80/20 train/val split from whichever source succeeds.

@@ -1,0 +1,148 @@
+"""
+Auto-generated FL client module.
+Original script: backbone_image_classifier.py (PyTorch Lightning MNIST example)
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np # Retained for consistency with example module
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms
+from torchvision.datasets import MNIST
+
+
+# Using nn.Module as base for classifiers
+class Backbone(nn.Module):
+    """
+    A simple two-layer neural network backbone for MNIST.
+    Inputs are flattened 28x28 images.
+    Outputs are 10 logits for classification.
+    """
+    def __init__(self, hidden_dim: int = 128):
+        super().__init__()
+        self.l1 = nn.Linear(28 * 28, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, 10)
+
+    def forward(self, x):
+        # Flatten the image from (batch_size, 1, 28, 28) to (batch_size, 784)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.l1(x))
+        # Returns logits directly, suitable for F.cross_entropy
+        return self.l2(x)
+
+
+class LitClassifier(nn.Module):
+    """
+    Wrapper for the Backbone, acting as the primary model.
+    Inherits from nn.Module for FL compatibility.
+    """
+    def __init__(self, backbone_kwargs: dict = None):
+        super().__init__()
+        if backbone_kwargs is None:
+            backbone_kwargs = {}
+        self.backbone = Backbone(**backbone_kwargs)
+
+    def forward(self, x):
+        return self.backbone(x)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Builds and returns the FL model (LitClassifier in this case).
+    Model parameters are loaded from `config["model_kwargs"]`.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    return LitClassifier(**model_kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Builds and returns a DataLoader for the specified split ("train", "val", "test", "predict").
+    Data is loaded from MNIST dataset.
+    """
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 32))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    # Use a configurable data_path, defaulting to a local 'data' directory
+    data_path = config.get("data_path", "./data")
+    seed = config.get("seed", 42) # Seed for random_split, consistent with original
+
+    transform = transforms.ToTensor()
+
+    if split in ("train", "val"):
+        full_train_dataset = MNIST(data_path, train=True, download=True, transform=transform)
+        
+        # Original script split: 55000 train, 5000 val from total 60000 training samples
+        n_train = 55000
+        n_val = 5000
+
+        # Adjust split sizes if the full dataset size is unexpected (e.g., due to custom dataset)
+        if len(full_train_dataset) != (n_train + n_val):
+            val_ratio = config.get("val_ratio", 5000 / 60000) # Maintain original ratio if possible
+            n_val = max(1, int(len(full_train_dataset) * val_ratio))
+            n_train = len(full_train_dataset) - n_val
+
+        train_ds, val_ds = random_split(
+            full_train_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(seed),
+        )
+        ds = train_ds if split == "train" else val_ds
+    elif split in ("test", "predict"):
+        ds = MNIST(data_path, train=False, download=True, transform=transform)
+    else:
+        raise ValueError(f"Unsupported split: {split}")
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"), # Only shuffle training data
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer, # optimizer is passed by the FL runtime but not used directly here
+    config: dict,
+) -> torch.Tensor:
+    """
+    Performs one forward pass and computes the loss.
+    Returns the raw loss tensor with grad_fn attached.
+    """
+    device = next(model.parameters()).device # Get current device of the model
+
+    # Move batch data to the correct device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    loss = F.cross_entropy(outputs, targets)
+    return loss

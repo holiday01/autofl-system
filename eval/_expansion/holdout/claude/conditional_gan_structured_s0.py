@@ -1,0 +1,294 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import numpy as np
+import os
+
+# ── Constants matching the original script ────────────────────────────────────
+num_channels = 1
+num_classes = 10
+image_size = 28
+latent_dim = 128
+
+generator_in_channels = latent_dim + num_classes       # 138
+discriminator_in_channels = num_channels + num_classes  # 11
+
+
+# ── Model definitions (Keras → PyTorch) ──────────────────────────────────────
+
+class Discriminator(nn.Module):
+    """
+    PyTorch equivalent of the Keras discriminator:
+      Input  : (B, discriminator_in_channels, 28, 28)
+      Conv2d 64  3×3 stride-2 same-pad  → LeakyReLU(0.2)
+      Conv2d 128 3×3 stride-2 same-pad  → LeakyReLU(0.2)
+      GlobalMaxPool                     → Flatten
+      Linear(128 → 1)
+    """
+    def __init__(self, in_channels: int = discriminator_in_channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.AdaptiveMaxPool2d(1),
+            nn.Flatten(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Generator(nn.Module):
+    """
+    PyTorch equivalent of the Keras generator:
+      Input  : (B, generator_in_channels)
+      Linear → 7×7×gen_in   → LeakyReLU(0.2) → Reshape (B, gen_in, 7, 7)
+      ConvTranspose2d 128 4×4 stride-2 → LeakyReLU(0.2)
+      ConvTranspose2d 128 4×4 stride-2 → LeakyReLU(0.2)
+      Conv2d 1 7×7 same-pad             → Sigmoid
+    """
+    def __init__(self, in_channels: int = generator_in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.fc = nn.Linear(in_channels, 7 * 7 * in_channels)
+        self.lrelu_fc = nn.LeakyReLU(0.2)
+        self.deconv_net = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, 128, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 1, kernel_size=7, padding=3),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.lrelu_fc(self.fc(x))
+        x = x.view(x.size(0), self.in_channels, 7, 7)
+        return self.deconv_net(x)
+
+
+class ConditionalGAN(nn.Module):
+    """
+    Conditional GAN wrapping both Generator and Discriminator.
+
+    forward() computes the combined generator + discriminator loss
+    (a single scalar with grad attached) for use in the FL train_step.
+
+    Training protocol inside forward():
+      • Discriminator loss  –  fake images are detached so D-gradients
+        do not back-propagate through G.
+      • Generator loss      –  fresh fake images (not detached) are passed
+        through the frozen-in-FL-sense discriminator; only G receives
+        meaningful gradients from g_loss.
+      • Combined loss g_loss + d_loss is returned; the FL runtime calls
+        backward() and optimizer.step() exactly once.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 128,
+        num_classes: int = 10,
+        num_channels: int = 1,
+        image_size: int = 28,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
+        self.num_channels = num_channels
+        self.image_size = image_size
+
+        gen_in = latent_dim + num_classes
+        disc_in = num_channels + num_classes
+
+        self.generator = Generator(gen_in)
+        self.discriminator = Discriminator(disc_in)
+
+    def forward(
+        self,
+        real_images: torch.Tensor,
+        one_hot_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            real_images:    (B, C, H, W)  – normalised to [0, 1]
+            one_hot_labels: (B, num_classes)
+        Returns:
+            Scalar loss = g_loss + d_loss, with gradients attached.
+        """
+        device = real_images.device
+        B = real_images.size(0)
+        H = W = self.image_size
+
+        # Spatial label map for discriminator: (B, num_classes, H, W)
+        spatial_labels = (
+            one_hot_labels.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)
+        )
+
+        # ── Discriminator forward ─────────────────────────────────────────
+        z_d = torch.randn(B, self.latent_dim, device=device)
+        noise_labels_d = torch.cat([z_d, one_hot_labels], dim=1)
+        # detach so discriminator loss does NOT update generator weights
+        fake_images_d = self.generator(noise_labels_d).detach()
+
+        fake_and_labels_d = torch.cat([fake_images_d, spatial_labels], dim=1)
+        real_and_labels_d = torch.cat([real_images, spatial_labels], dim=1)
+        combined = torch.cat([fake_and_labels_d, real_and_labels_d], dim=0)
+
+        # Fake → 1, Real → 0  (matches original label convention)
+        d_targets = torch.cat(
+            [torch.ones(B, 1, device=device), torch.zeros(B, 1, device=device)],
+            dim=0,
+        )
+        d_loss = F.binary_cross_entropy_with_logits(
+            self.discriminator(combined), d_targets
+        )
+
+        # ── Generator forward ─────────────────────────────────────────────
+        z_g = torch.randn(B, self.latent_dim, device=device)
+        noise_labels_g = torch.cat([z_g, one_hot_labels], dim=1)
+        fake_images_g = self.generator(noise_labels_g)  # keep grad for G
+
+        fake_and_labels_g = torch.cat([fake_images_g, spatial_labels], dim=1)
+        misleading = torch.zeros(B, 1, device=device)
+        g_loss = F.binary_cross_entropy_with_logits(
+            self.discriminator(fake_and_labels_g), misleading
+        )
+
+        return g_loss + d_loss
+
+
+# ── FL interface ──────────────────────────────────────────────────────────────
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    """
+    Instantiate and return the ConditionalGAN.
+
+    Recognised model_kwargs:
+        latent_dim  (int, default 128)
+        num_classes (int, default 10)
+        num_channels(int, default 1)
+        image_size  (int, default 28)
+    """
+    kwargs = config.get("model_kwargs", {})
+    return ConditionalGAN(
+        latent_dim=kwargs.get("latent_dim", latent_dim),
+        num_classes=kwargs.get("num_classes", num_classes),
+        num_channels=kwargs.get("num_channels", num_channels),
+        image_size=kwargs.get("image_size", image_size),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+
+    Each batch is (images, one_hot_labels):
+        images      – FloatTensor (B, 1, 28, 28), values in [0, 1]
+        one_hot_labels – FloatTensor (B, 10)
+
+    Data-loading order of preference:
+      1. torchvision MNIST from data_path   (download=False)
+      2. Synthetic placeholder              (only if allow_synthetic_data=True)
+      3. FileNotFoundError                  (allow_synthetic_data=False)
+    """
+    batch_sz = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+
+    full_dataset = None
+
+    # ── Attempt 1: real MNIST via torchvision ─────────────────────────────
+    try:
+        from torchvision import datasets as tv_datasets
+
+        train_tv = tv_datasets.MNIST(
+            root=data_path, train=True, download=False
+        )
+        test_tv = tv_datasets.MNIST(
+            root=data_path, train=False, download=False
+        )
+
+        # Use .data / .targets directly to avoid per-sample iteration
+        all_images = torch.cat(
+            [
+                train_tv.data.unsqueeze(1).float() / 255.0,
+                test_tv.data.unsqueeze(1).float() / 255.0,
+            ]
+        )  # (N, 1, 28, 28)
+
+        all_targets = torch.cat([train_tv.targets, test_tv.targets])
+        all_labels = F.one_hot(
+            all_targets.long(), num_classes=num_classes
+        ).float()  # (N, 10)
+
+        full_dataset = TensorDataset(all_images, all_labels)
+
+    except Exception:
+        pass  # fall through to synthetic check
+
+    # ── Attempt 2: synthetic fallback ─────────────────────────────────────
+    if full_dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"MNIST dataset not found at '{data_path}'. "
+                "Either download MNIST to that directory first "
+                "or set config['allow_synthetic_data'] = True to train on "
+                "synthetic placeholder data."
+            )
+        n_synth = 1000
+        syn_images = torch.randn(n_synth, 1, 28, 28)
+        syn_labels = F.one_hot(
+            torch.randint(0, num_classes, (n_synth,)), num_classes=num_classes
+        ).float()
+        full_dataset = TensorDataset(syn_images, syn_labels)
+
+    # ── train / val random split (80 / 20) ────────────────────────────────
+    n_total = len(full_dataset)
+    n_train = int(0.8 * n_total)
+    n_val = n_total - n_train
+    train_ds, val_ds = random_split(
+        full_dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen = train_ds if split == "train" else val_ds
+    return DataLoader(
+        chosen,
+        batch_size=batch_sz,
+        shuffle=(split == "train"),
+        drop_last=True,   # keep consistent batch sizes for GAN training
+        num_workers=0,
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    Run ONE forward pass of ConditionalGAN and return the combined loss.
+
+    The FL runtime is responsible for calling loss.backward() and
+    optimizer.step(); this function does NOT do either.
+
+    Args:
+        model:     ConditionalGAN instance (returned by build_model).
+        batch:     (images, one_hot_labels) tuple from build_dataloader.
+        optimizer: provided by FL runtime (unused here).
+        config:    FL configuration dict.
+    Returns:
+        Scalar loss tensor with grad attached (g_loss + d_loss).
+    """
+    real_images, one_hot_labels = batch
+    device = next(model.parameters()).device
+    real_images = real_images.to(device)
+    one_hot_labels = one_hot_labels.to(device)
+    loss = model(real_images, one_hot_labels)
+    return loss

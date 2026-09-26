@@ -1,0 +1,23 @@
+# AutoFL: Python dependencies (ranges). For the exact versions used in the
+# paper see requirements-lock.txt and the Dockerfile.
+torch>=2.0,<3.0
+torchvision>=0.15
+lightning>=2.0                 # PyTorch Lightning benchmark scripts
+monai>=1.3                     # MONAI benchmark scripts
+nibabel>=5.0                   # MONAI 3D NIfTI loading (spleen_segmentation_3d)
+scikit-learn>=1.3
+xgboost>=2.0
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10                    # exact McNemar (binomial) tests, Clopper-Pearson CIs
+matplotlib>=3.7
+pillow>=10.0
+pyyaml>=6.0
+psutil>=5.9
+google-genai>=1.0              # Gemini provider only
+pytest>=7.0                    # tests only
+# Not pip-installable:
+#   Claude provider -> the `claude` command-line client (Claude Code), invoked via subprocess
+#   Ollama provider -> a local Ollama server (`ollama pull llama3`)
+# TensorFlow is deliberately NOT installed: the paper's validation environment
+# has no TensorFlow/Keras, so clients that keep Keras imports fail at Stage 1.

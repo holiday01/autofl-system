@@ -1,0 +1,317 @@
+```python
+# FL Client Module
+# Converted from XGBoost sklearn-interface example (Jamie Hall, 1 Apr 2015)
+# XGBoost classifiers/regressor → equivalent torch.nn.Module MLPs
+
+import pickle
+from typing import Optional
+from urllib.error import HTTPError
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+from sklearn.datasets import (
+    fetch_california_housing,
+    load_digits,
+    load_iris,
+    make_regression,
+)
+from sklearn.metrics import confusion_matrix, mean_squared_error
+from sklearn.model_selection import GridSearchCV, KFold, train_test_split
+from sklearn.preprocessing import StandardScaler
+
+import xgboost as xgb
+
+rng = np.random.RandomState(31337)
+
+
+# ── PyTorch equivalents of the original XGBoost models ───────────────────────
+
+class XGBClassifierNet(nn.Module):
+    """
+    PyTorch MLP equivalent of xgb.XGBClassifier.
+
+    Handles both binary (num_classes=2) and multiclass (num_classes>2)
+    tabular classification. LayerNorm is used instead of BatchNorm so the
+    module is stable at batch-size 1 (common during FL validation).
+    """
+
+    def __init__(
+        self,
+        in_features: int = 64,
+        num_classes: int = 2,
+        hidden_dim: int = 128,
+        num_layers: int = 4,
+    ) -> None:
+        super().__init__()
+        blocks: list = [
+            nn.Linear(in_features, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        ]
+        for _ in range(num_layers - 1):
+            blocks += [
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+            ]
+        blocks.append(nn.Linear(hidden_dim, num_classes))
+        self.net = nn.Sequential(*blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class XGBRegressorNet(nn.Module):
+    """
+    PyTorch MLP equivalent of xgb.XGBRegressor for tabular regression
+    (e.g. California Housing).
+    """
+
+    def __init__(
+        self,
+        in_features: int = 8,
+        hidden_dim: int = 128,
+        num_layers: int = 4,
+    ) -> None:
+        super().__init__()
+        blocks: list = [
+            nn.Linear(in_features, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        ]
+        for _ in range(num_layers - 1):
+            blocks += [
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+            ]
+        blocks.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
+# ── Dataset wrapper ────────────────────────────────────────────────────────────
+
+class TabularDataset(Dataset):
+    """
+    Wraps a NumPy (X, y) pair as a PyTorch Dataset.
+    Applies z-score normalisation via StandardScaler fitted on the full split.
+    """
+
+    def __init__(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        task: str = "regression",
+    ) -> None:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X).astype(np.float32)
+        self.X = torch.from_numpy(X_scaled)
+        if task in ("binary", "multiclass"):
+            self.y = torch.from_numpy(y.astype(np.int64))
+        else:
+            self.y = torch.from_numpy(y.astype(np.float32))
+
+    def __len__(self) -> int:
+        return len(self.X)
+
+    def __getitem__(self, idx: int):
+        return self.X[idx], self.y[idx]
+
+
+# ── FL interface ───────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Instantiate and return the model.
+
+    Relevant config keys
+    --------------------
+    task          : "binary" | "multiclass" | "regression"  (default "regression")
+                    "binary"      → XGBClassifierNet  (Digits 0-vs-1)
+                    "multiclass"  → XGBClassifierNet  (Iris 3-class)
+                    "regression"  → XGBRegressorNet   (California Housing)
+    model_kwargs  : dict forwarded to the model constructor
+      Common keys: in_features, num_classes (classification only),
+                   hidden_dim, num_layers
+    """
+    task = config.get("task", "regression")
+    kwargs = config.get("model_kwargs", {})
+
+    if task == "binary":
+        return XGBClassifierNet(
+            in_features=kwargs.get("in_features", 64),
+            num_classes=kwargs.get("num_classes", 2),
+            hidden_dim=kwargs.get("hidden_dim", 128),
+            num_layers=kwargs.get("num_layers", 4),
+        )
+    elif task == "multiclass":
+        return XGBClassifierNet(
+            in_features=kwargs.get("in_features", 4),
+            num_classes=kwargs.get("num_classes", 3),
+            hidden_dim=kwargs.get("hidden_dim", 64),
+            num_layers=kwargs.get("num_layers", 4),
+        )
+    else:  # regression
+        return XGBRegressorNet(
+            in_features=kwargs.get("in_features", 8),
+            hidden_dim=kwargs.get("hidden_dim", 128),
+            num_layers=kwargs.get("num_layers", 4),
+        )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+
+    Dataset selection (config["task"])
+    -----------------------------------
+    "binary"      → sklearn load_digits(n_class=2)        (always available)
+    "multiclass"  → sklearn load_iris()                   (always available)
+    "regression"  → sklearn fetch_california_housing()    (requires internet)
+
+    Relevant config keys
+    --------------------
+    task                  : see above (default "regression")
+    local.batch_size      : int   (default 16)
+    data_path             : str   (default ".")  — reserved for future local files
+    val_ratio             : float (default 0.2)
+    allow_synthetic_data  : bool  (default False)
+        If True and real data is unavailable, fall back to torch.randn/randint.
+        If False and real data is unavailable, raises FileNotFoundError.
+    synthetic_n_samples   : int   (default 1 000) — size of the synthetic dataset
+    model_kwargs          : used to infer in_features / num_classes for synthetic data
+    """
+    task = config.get("task", "regression")
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    val_ratio = config.get("val_ratio", 0.2)
+    allow_synthetic = config.get("allow_synthetic_data", False)
+
+    # ── attempt to load the real dataset ──────────────────────────────────────
+    dataset: Optional[Dataset] = None
+    load_error: Optional[Exception] = None
+
+    try:
+        if task == "binary":
+            digits = load_digits(n_class=2)
+            X_np, y_np = digits["data"], digits["target"]
+            dataset = TabularDataset(X_np, y_np, task=task)
+        elif task == "multiclass":
+            iris = load_iris()
+            X_np, y_np = iris["data"], iris["target"]
+            dataset = TabularDataset(X_np, y_np, task=task)
+        else:  # regression — network fetch, may raise HTTPError
+            X_np, y_np = fetch_california_housing(return_X_y=True)
+            dataset = TabularDataset(X_np, y_np, task=task)
+    except Exception as exc:
+        load_error = exc
+
+    # ── fallback or hard failure ───────────────────────────────────────────────
+    if dataset is None:
+        if not allow_synthetic:
+            raise FileNotFoundError(
+                f"Real dataset for task='{task}' is unavailable "
+                f"({load_error!r}). "
+                "Set config['allow_synthetic_data'] = True to use synthetic "
+                "data instead."
+            ) from load_error
+
+        # synthetic fallback — only reached when allow_synthetic_data is True
+        n_samples = config.get("synthetic_n_samples", 1000)
+        mk = config.get("model_kwargs", {})
+
+        if task == "binary":
+            in_f = mk.get("in_features", 64)
+            n_cls = mk.get("num_classes", 2)
+            X_syn = torch.randn(n_samples, in_f)
+            y_syn = torch.randint(0, n_cls, (n_samples,))
+        elif task == "multiclass":
+            in_f = mk.get("in_features", 4)
+            n_cls = mk.get("num_classes", 3)
+            X_syn = torch.randn(n_samples, in_f)
+            y_syn = torch.randint(0, n_cls, (n_samples,))
+        else:  # regression
+            in_f = mk.get("in_features", 8)
+            X_syn = torch.randn(n_samples, in_f)
+            y_syn = torch.randn(n_samples)
+
+        dataset = TensorDataset(X_syn, y_syn)
+
+    # ── train / val split ─────────────────────────────────────────────────────
+    n_total = len(dataset)
+    n_val = max(1, int(n_total * val_ratio))
+    n_train = n_total - n_val
+
+    train_set, val_set = random_split(
+        dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen = train_set if split == "train" else val_set
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        drop_last=False,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    Run ONE forward pass and return the loss tensor with grad attached.
+
+    Does NOT call loss.backward() or optimizer.step() — the FL runtime owns
+    those calls.
+
+    Loss function
+    -------------
+    "binary" / "multiclass"  → nn.CrossEntropyLoss  (logits → class indices)
+    "regression"             → nn.MSELoss
+    """
+    task = config.get("task", "regression")
+    device = next(model.parameters()).device
+
+    X, y = batch
+    X = X.to(device)
+    y = y.to(device)
+
+    logits = model(X)
+
+    if task in ("binary", "multiclass"):
+        loss = nn.CrossEntropyLoss()(logits, y)
+    else:
+        loss = nn.MSELoss()(logits, y)
+
+    return loss
+```
+
+---
+
+### Key conversion decisions
+
+| Original | FL module |
+|---|---|
+| `xgb.XGBClassifier` | `XGBClassifierNet` — LayerNorm MLP, configurable depth/width |
+| `xgb.XGBRegressor` | `XGBRegressorNet` — same design, scalar output via `squeeze(-1)` |
+| `KFold` cross-validation | `random_split` into a persistent train/val split (seed 42) |
+| `GridSearchCV` hyper-search | driven by `config["model_kwargs"]` at instantiation time |
+| In-script dataset fetches | `build_dataloader` with per-task branching + synthetic gate |
+| `confusion_matrix` / `mean_squared_error` eval | delegated to the FL runtime (out of scope for `train_step`) |
+
+**`LayerNorm` vs `BatchNorm`** — LayerNorm is used throughout so the model is numerically stable at batch-size 1, which is common during FL validation rounds.
+
+**Synthetic-data gate** — `build_dataloader` never silently trains on fake data. Real-data failure raises `FileNotFoundError` unless `config["allow_synthetic_data"]` is explicitly `True`.
+
+**`train_step` contract** — returns the loss tensor *with its computation graph intact*; `backward()` and `optimizer.step()` are intentionally absent so the FL aggregator can intercept gradients before the update.

@@ -1,0 +1,230 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision import transforms
+from PIL import Image, UnidentifiedImageError
+
+
+class SeparableConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size, padding=padding, groups=in_channels
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1)
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
+
+class MiniXception(nn.Module):
+    """
+    PyTorch equivalent of the Keras mini-Xception built by make_model().
+    Rescaling (÷255) is kept inside forward() to mirror the original design.
+    """
+
+    def __init__(self, input_shape=(180, 180, 3), num_classes=2):
+        super().__init__()
+        in_channels = input_shape[2] if len(input_shape) == 3 else input_shape[0]
+
+        # Entry block
+        self.entry_conv = nn.Conv2d(in_channels, 128, 3, stride=2, padding=1)
+        self.entry_bn = nn.BatchNorm2d(128)
+
+        # Residual blocks
+        block_sizes = [256, 512, 728]
+        self.res_blocks = nn.ModuleList()
+        self.projections = nn.ModuleList()
+        prev = 128
+        for size in block_sizes:
+            self.res_blocks.append(
+                nn.Sequential(
+                    nn.ReLU(),
+                    SeparableConv2d(prev, size),
+                    nn.BatchNorm2d(size),
+                    nn.ReLU(),
+                    SeparableConv2d(size, size),
+                    nn.BatchNorm2d(size),
+                    nn.MaxPool2d(3, stride=2, padding=1),
+                )
+            )
+            # 1×1 strided projection to match spatial dims and channel count
+            self.projections.append(nn.Conv2d(prev, size, 1, stride=2))
+            prev = size
+
+        # Top block
+        self.top_sep = SeparableConv2d(728, 1024)
+        self.top_bn = nn.BatchNorm2d(1024)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.25)
+        units = 1 if num_classes == 2 else num_classes
+        self.classifier = nn.Linear(1024, units)
+
+    def forward(self, x):
+        x = x / 255.0  # Rescaling layer
+
+        x = F.relu(self.entry_bn(self.entry_conv(x)))
+
+        for block, proj in zip(self.res_blocks, self.projections):
+            residual = proj(x)
+            x = block(x) + residual
+
+        x = F.relu(self.top_bn(self.top_sep(x)))
+        x = self.gap(x).flatten(1)
+        x = self.dropout(x)
+        return self.classifier(x)
+
+
+class CatsDogsDataset(Dataset):
+    """
+    Loads PetImages/{Cat,Dog} from disk.
+    Images are returned as float32 tensors in [0, 255] (model rescales internally).
+    """
+
+    def __init__(self, data_path, transform=None):
+        self.transform = transform
+        self.samples = []
+        pet_root = os.path.join(data_path, "PetImages")
+        if not os.path.isdir(pet_root):
+            raise FileNotFoundError(
+                f"Expected dataset directory not found: '{pet_root}'. "
+                "Download the Cats vs Dogs dataset or set "
+                "config['allow_synthetic_data']=True for synthetic testing data."
+            )
+        for label_idx, folder in enumerate(("Cat", "Dog")):
+            folder_path = os.path.join(pet_root, folder)
+            if not os.path.isdir(folder_path):
+                raise FileNotFoundError(
+                    f"Class folder not found: '{folder_path}'."
+                )
+            for fname in sorted(os.listdir(folder_path)):
+                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                    self.samples.append((os.path.join(folder_path, fname), label_idx))
+        if not self.samples:
+            raise FileNotFoundError(
+                f"No valid image files found under '{pet_root}'."
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        fpath, label = self.samples[idx]
+        try:
+            img = Image.open(fpath).convert("RGB")
+        except (UnidentifiedImageError, OSError):
+            img = Image.fromarray(np.zeros((180, 180, 3), dtype=np.uint8))
+        img = img.resize((180, 180))
+        if self.transform:
+            img = self.transform(img)
+        else:
+            # Default: PIL -> float32 tensor in [0, 255]
+            img = torch.from_numpy(np.array(img, dtype=np.float32)).permute(2, 0, 1)
+        return img, torch.tensor(label, dtype=torch.float32)
+
+
+def _make_transforms(augment: bool):
+    base = [
+        transforms.Resize((180, 180)),
+    ]
+    if augment:
+        # RandomFlip("horizontal") + RandomRotation(0.1 × 2π ≈ 36°)
+        base += [
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(36),
+        ]
+    base.append(transforms.ToTensor())
+    # ToTensor normalises to [0,1]; scale back to [0,255] to match model's
+    # internal Rescaling(1/255) layer
+    base.append(transforms.Lambda(lambda t: t * 255.0))
+    return transforms.Compose(base)
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    input_shape = kwargs.get("input_shape", (180, 180, 3))
+    num_classes = kwargs.get("num_classes", 2)
+    return MiniXception(input_shape=input_shape, num_classes=num_classes)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+
+    try:
+        # Build full dataset with augment=False; augmentation applied only to
+        # train subset via a wrapper so val images are never augmented.
+        full_dataset = CatsDogsDataset(data_path, transform=_make_transforms(augment=False))
+        real_data = True
+    except FileNotFoundError as exc:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Real dataset unavailable ({exc}). "
+                "Set config['allow_synthetic_data']=True to use synthetic data for testing."
+            ) from exc
+        real_data = False
+
+    if not real_data:
+        n = 200
+        images = torch.randint(0, 256, (n, 3, 180, 180), dtype=torch.float32)
+        labels = torch.randint(0, 2, (n,), dtype=torch.float32)
+        dataset = torch.utils.data.TensorDataset(images, labels)
+        val_size = max(1, int(0.2 * n))
+        train_subset, val_subset = random_split(
+            dataset, [n - val_size, val_size],
+            generator=torch.Generator().manual_seed(1337),
+        )
+        chosen = train_subset if split == "train" else val_subset
+        return DataLoader(chosen, batch_size=batch_size, shuffle=(split == "train"))
+
+    val_size = max(1, int(0.2 * len(full_dataset)))
+    train_size = len(full_dataset) - val_size
+    train_subset, val_subset = random_split(
+        full_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(1337),
+    )
+
+    if split == "train":
+        # Re-wrap training indices with augmentation transforms
+        class _AugDataset(Dataset):
+            def __init__(self, subset):
+                self.subset = subset
+                self.aug_transform = _make_transforms(augment=True)
+
+            def __len__(self):
+                return len(self.subset)
+
+            def __getitem__(self, idx):
+                fpath, label = self.subset.dataset.samples[self.subset.indices[idx]]
+                try:
+                    img = Image.open(fpath).convert("RGB")
+                except (UnidentifiedImageError, OSError):
+                    img = Image.fromarray(np.zeros((180, 180, 3), dtype=np.uint8))
+                return self.aug_transform(img), torch.tensor(label, dtype=torch.float32)
+
+        chosen = _AugDataset(train_subset)
+    else:
+        chosen = val_subset
+
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=2,
+        pin_memory=True,
+    )
+
+
+def train_step(model, batch, optimizer, config: dict) -> torch.Tensor:
+    images, labels = batch
+    device = next(model.parameters()).device
+    images = images.to(device)
+    labels = labels.to(device)
+
+    logits = model(images).squeeze(1)  # (B, 1) -> (B,) for binary BCE
+    loss = F.binary_cross_entropy_with_logits(logits, labels)
+    # Do NOT call loss.backward() or optimizer.step() — handled by FL runtime
+    return loss

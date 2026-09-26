@@ -1,0 +1,126 @@
+"""
+Auto-generated FL client module.
+Original script: sklearn early stopping SGD example (binary MNIST classification).
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+
+
+class MNISTBinaryDataset(Dataset):
+    """Binary MNIST dataset filtered to two digit classes."""
+
+    def __init__(self, root: str = ".", class_0: str = "0", class_1: str = "8",
+                 n_samples: int = None):
+        from sklearn.datasets import fetch_openml
+        from sklearn.utils import shuffle as sk_shuffle
+
+        mnist = fetch_openml("mnist_784", version=1, as_frame=False, data_home=root)
+        mask = np.logical_or(
+            mnist.target.astype(str) == str(class_0),
+            mnist.target.astype(str) == str(class_1),
+        )
+        X, y = sk_shuffle(mnist.data[mask], mnist.target[mask], random_state=42)
+        if n_samples is not None:
+            X, y = X[:n_samples], y[:n_samples]
+
+        label_map = {str(class_0): 0, str(class_1): 1}
+        y_int = np.array([label_map[str(yi)] for yi in y], dtype=np.int64)
+
+        self.X = torch.tensor(X, dtype=torch.float32) / 255.0
+        self.y = torch.tensor(y_int, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+class LinearClassifier(nn.Module):
+    """Linear classifier — PyTorch analogue of sklearn SGDClassifier (log loss)."""
+
+    def __init__(self, input_dim: int = 784, num_classes: int = 2):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, num_classes)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return LinearClassifier(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 64))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    dataset_kwargs = config.get("dataset_kwargs", {})
+    data_path = config.get("data_path", ".")
+    full_dataset = MNISTBinaryDataset(root=data_path, **dataset_kwargs)
+
+    # val_ratio=0.2 mirrors original's validation_fraction=0.2
+    val_ratio = config.get("val_ratio", 0.2)
+    n_val = max(1, int(len(full_dataset) * val_ratio))
+    n_train = len(full_dataset) - n_val
+    train_ds, val_ds = random_split(
+        full_dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(config.get("seed", 42)),
+    )
+    ds = train_ds if split == "train" else val_ds
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(outputs, targets)
+    return loss

@@ -1,0 +1,353 @@
+import numpy as np
+import keras
+import os
+from pathlib import Path
+import random
+import shutil
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+
+# --- Keras to PyTorch Model Conversion ---
+
+class EncoderRNN(nn.Module):
+    """
+    PyTorch equivalent of the Keras Encoder LSTM.
+    Takes one-hot encoded input sequences and returns the final hidden and cell states.
+    """
+    def __init__(self, input_size: int, latent_dim: int):
+        super(EncoderRNN, self).__init__()
+        self.latent_dim = latent_dim
+        # batch_first=True makes the input/output dimensions (batch_size, seq_len, features)
+        self.lstm = nn.LSTM(input_size, latent_dim, batch_first=True)
+
+    def forward(self, input_seq: torch.Tensor):
+        # input_seq: (batch_size, seq_len, input_size)
+        # The LSTM returns output, (h_n, c_n). We only need h_n and c_n for the encoder states.
+        _, (hidden, cell) = self.lstm(input_seq)
+        # hidden, cell: (num_layers * num_directions, batch_size, latent_dim)
+        # For a single-layer, unidirectional LSTM, it's (1, batch_size, latent_dim)
+        return hidden, cell
+
+class DecoderRNN(nn.Module):
+    """
+    PyTorch equivalent of the Keras Decoder LSTM and Dense layers.
+    Takes one-hot encoded target sequences (for teacher forcing) and initial states
+    from the encoder, returning output logits for character prediction.
+    """
+    def __init__(self, output_size: int, latent_dim: int):
+        super(DecoderRNN, self).__init__()
+        self.latent_dim = latent_dim
+        # batch_first=True, return_sequences=True (default for nn.LSTM) matches Keras behavior
+        self.lstm = nn.LSTM(output_size, latent_dim, batch_first=True)
+        # The Keras model used 'softmax' activation in the Dense layer.
+        # For PyTorch's CrossEntropyLoss, it's more numerically stable to
+        # feed raw logits directly. CrossEntropyLoss internally applies log_softmax.
+        self.dense = nn.Linear(latent_dim, output_size)
+
+    def forward(self, input_seq: torch.Tensor, initial_hidden_state: torch.Tensor, initial_cell_state: torch.Tensor):
+        # input_seq: (batch_size, seq_len, output_size)
+        # initial_hidden_state, initial_cell_state: (1, batch_size, latent_dim)
+        output, (hidden, cell) = self.lstm(
+            input_seq, (initial_hidden_state, initial_cell_state)
+        )
+        # output: (batch_size, seq_len, latent_dim) - This is the hidden states for each timestep
+        output = self.dense(output)
+        # output: (batch_size, seq_len, output_size) - These are the logits
+        return output, hidden, cell
+
+class Seq2Seq(nn.Module):
+    """
+    Combines the Encoder and Decoder for the sequence-to-sequence model.
+    """
+    def __init__(self, num_encoder_tokens: int, num_decoder_tokens: int, latent_dim: int):
+        super(Seq2Seq, self).__init__()
+        self.encoder = EncoderRNN(num_encoder_tokens, latent_dim)
+        self.decoder = DecoderRNN(num_decoder_tokens, latent_dim)
+
+    def forward(self, encoder_input_data: torch.Tensor, decoder_input_data: torch.Tensor):
+        # encoder_input_data: (batch_size, max_encoder_seq_length, num_encoder_tokens)
+        # decoder_input_data: (batch_size, max_decoder_seq_length, num_decoder_tokens)
+        encoder_hidden, encoder_cell = self.encoder(encoder_input_data)
+        decoder_outputs, _, _ = self.decoder(
+            decoder_input_data, encoder_hidden, encoder_cell
+        )
+        # decoder_outputs: (batch_size, max_decoder_seq_length, num_decoder_tokens) (logits)
+        return decoder_outputs
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Instantiates and returns the PyTorch sequence-to-sequence model.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    latent_dim = model_kwargs.get("latent_dim", 256)
+    num_encoder_tokens = model_kwargs.get("num_encoder_tokens", 71)  # Default based on original data
+    num_decoder_tokens = model_kwargs.get("num_decoder_tokens", 93)  # Default based on original data
+
+    # If `num_encoder_tokens` or `num_decoder_tokens` are not provided in config,
+    # they will be populated by the dataset during the first call, and stored back to config.
+    # For now, we use defaults, or rely on them being set correctly by FL orchestrator
+    # after a 'get_properties' call or similar mechanism if they are dynamic.
+    # For this specific example, we'll assume they will be set in the config after
+    # the dataset has been processed (e.g., in a pre-run). If not, client will fail if
+    # the default values don't match the actual dataset.
+    # In a real FL scenario, vocab sizes are usually shared in the config from the server or a pre-analysis step.
+
+    # This is a bit of a chicken-and-egg problem if vocab sizes are dynamic per client.
+    # For this script, we assume a global vocabulary derived from a common dataset,
+    # or that the config already contains these computed values.
+    # If the FL runtime expects a model before data is loaded, these must be in config.
+    
+    model = Seq2Seq(num_encoder_tokens, num_decoder_tokens, latent_dim)
+    return model
+
+# --- Data Loading and Preprocessing ---
+
+class Seq2SeqDataset(Dataset):
+    """
+    A PyTorch Dataset for the character-level sequence-to-sequence task.
+    Handles loading, tokenization, and one-hot encoding of text data.
+    Includes a fallback for synthetic data generation.
+    """
+    def __init__(self, data_path: str, num_samples: int, allow_synthetic_data: bool):
+        self.input_texts = []
+        self.target_texts = []
+        self.input_characters = set()
+        self.target_characters = set()
+
+        if data_path is None or not os.path.exists(data_path):
+            if allow_synthetic_data:
+                print("Synthetic data mode: Real data file not found or path is None, generating synthetic data.")
+                self._generate_synthetic_data(num_samples)
+            else:
+                raise FileNotFoundError(
+                    f"Data file not found at {data_path}. Set 'allow_synthetic_data=True' in config to use synthetic data."
+                )
+        else:
+            with open(data_path, "r", encoding="utf-8") as f:
+                lines = f.read().split("\n")
+            for line in lines[: min(num_samples, len(lines) - 1)]:
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    input_text, target_text = parts[0], parts[1]
+                else:
+                    continue # Skip malformed lines
+
+                target_text = "\t" + target_text + "\n"  # Add start/end tokens
+                self.input_texts.append(input_text)
+                self.target_texts.append(target_text)
+
+                for char in input_text:
+                    self.input_characters.add(char)
+                for char in target_text:
+                    self.target_characters.add(char)
+        
+        if not self.input_texts:
+            if allow_synthetic_data:
+                 print("No real data loaded, generating synthetic data instead.")
+                 self._generate_synthetic_data(num_samples)
+            else:
+                 raise ValueError(f"No samples loaded from {data_path} and synthetic data is not allowed.")
+
+        self.input_characters = sorted(list(self.input_characters))
+        self.target_characters = sorted(list(self.target_characters))
+        self.num_encoder_tokens = len(self.input_characters)
+        self.num_decoder_tokens = len(self.target_characters)
+        self.max_encoder_seq_length = max([len(txt) for txt in self.input_texts]) if self.input_texts else 1
+        self.max_decoder_seq_length = max([len(txt) for txt in self.target_texts]) if self.target_texts else 1
+
+        self.input_token_index = dict([(char, i) for i, char in enumerate(self.input_characters)])
+        self.target_token_index = dict([(char, i) for i, char in enumerate(self.target_characters)])
+
+        self._vectorize_data()
+
+    def _generate_synthetic_data(self, num_samples: int):
+        """Generates synthetic data if real data is unavailable or cannot be loaded."""
+        print(f"Generating {num_samples} synthetic samples.")
+        synthetic_chars = "abcdefghijklmnopqrstuvwxyz .!?"
+        max_len = 15
+        
+        # Ensure common characters are included in the vocabulary
+        self.input_characters = set(list(synthetic_chars) + [' '])
+        self.target_characters = set(list(synthetic_chars) + [' ', '\t', '\n'])
+
+        for _ in range(num_samples):
+            input_len = random.randint(3, max_len)
+            target_len = random.randint(3, max_len)
+            input_text = ''.join(random.choice(synthetic_chars) for _ in range(input_len))
+            target_text = ''.join(random.choice(synthetic_chars) for _ in range(target_len))
+            self.input_texts.append(input_text)
+            self.target_texts.append("\t" + target_text + "\n") # Add start/end tokens
+
+    def _vectorize_data(self):
+        """Pre-vectorizes all text data into one-hot NumPy arrays."""
+        self.encoder_input_data = np.zeros(
+            (len(self.input_texts), self.max_encoder_seq_length, self.num_encoder_tokens),
+            dtype="float32",
+        )
+        self.decoder_input_data = np.zeros(
+            (len(self.input_texts), self.max_decoder_seq_length, self.num_decoder_tokens),
+            dtype="float32",
+        )
+        self.decoder_target_data = np.zeros(
+            (len(self.input_texts), self.max_decoder_seq_length, self.num_decoder_tokens),
+            dtype="float32",
+        )
+
+        # Get index for space character for padding, or fallback to first available token
+        space_input_idx = self.input_token_index.get(" ", list(self.input_token_index.values())[0] if self.input_token_index else 0)
+        space_target_idx = self.target_token_index.get(" ", list(self.target_token_index.values())[0] if self.target_token_index else 0)
+
+        for i, (input_text, target_text) in enumerate(zip(self.input_texts, self.target_texts)):
+            for t, char in enumerate(input_text):
+                if char in self.input_token_index:
+                    self.encoder_input_data[i, t, self.input_token_index[char]] = 1.0
+            # Pad remaining sequence length with space or fallback token
+            if t + 1 < self.max_encoder_seq_length:
+                self.encoder_input_data[i, t + 1 :, space_input_idx] = 1.0
+
+            for t, char in enumerate(target_text):
+                if char in self.target_token_index:
+                    self.decoder_input_data[i, t, self.target_token_index[char]] = 1.0
+                    if t > 0:  # decoder_target_data is ahead by one timestep
+                        self.decoder_target_data[i, t - 1, self.target_token_index[char]] = 1.0
+            # Pad remaining sequence length for decoder input/target
+            if t + 1 < self.max_decoder_seq_length:
+                self.decoder_input_data[i, t + 1 :, space_target_idx] = 1.0
+            if t < self.max_decoder_seq_length: # decoder_target_data padding starts from current 't'
+                self.decoder_target_data[i, t :, space_target_idx] = 1.0
+
+    def __len__(self):
+        return len(self.input_texts)
+
+    def __getitem__(self, idx: int):
+        encoder_input = torch.tensor(self.encoder_input_data[idx], dtype=torch.float32)
+        decoder_input = torch.tensor(self.decoder_input_data[idx], dtype=torch.float32)
+        decoder_target = torch.tensor(self.decoder_target_data[idx], dtype=torch.float32)
+        return encoder_input, decoder_input, decoder_target
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Constructs and returns a DataLoader for the specified split (train or val).
+    Handles data download, extraction, and synthetic data fallback.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_root_dir = Path(config.get("data_path", "."))
+    num_samples = config.get("num_samples", 10000)
+    allow_synthetic_data = config.get("allow_synthetic_data", False)
+
+    data_root_dir.mkdir(parents=True, exist_ok=True)
+    extracted_data_file = data_root_dir / "fra.txt"
+
+    if not extracted_data_file.exists():
+        print(f"Data file '{extracted_data_file}' not found. Attempting to download and extract.")
+        try:
+            # keras.utils.get_file downloads to ~/.keras/datasets/ by default
+            zip_fpath_in_keras_cache = keras.utils.get_file(
+                origin="http://www.manythings.org/anki/fra-eng.zip",
+                cache_dir=str(Path.home() / ".keras"), # Explicitly set cache dir
+                cache_subdir="datasets",
+                extract=False # We handle extraction manually to specific target dir
+            )
+            
+            # Temporary extraction path within data_root_dir to handle the inner folder
+            temp_extract_dir = data_root_dir / "temp_extracted_fra_eng"
+            temp_extract_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Unzip contents to the temporary directory
+            os.system(f"unzip -o -q {zip_fpath_in_keras_cache} -d {temp_extract_dir}")
+            
+            # Move fra.txt from temp_extract_dir/fra-eng/fra.txt to extracted_data_file
+            source_fra_txt = temp_extract_dir / "fra-eng" / "fra.txt"
+            if source_fra_txt.exists():
+                os.rename(source_fra_txt, extracted_data_file)
+                shutil.rmtree(temp_extract_dir) # Clean up temporary directory
+                print(f"Successfully extracted data to '{extracted_data_file}'.")
+            else:
+                raise FileNotFoundError(f"Expected 'fra-eng/fra.txt' not found in temporary extraction at {temp_extract_dir}.")
+
+        except Exception as e:
+            if allow_synthetic_data:
+                print(f"Error downloading/extracting data: {e}. Falling back to synthetic data.")
+                dataset = Seq2SeqDataset(None, num_samples, allow_synthetic_data=True)
+            else:
+                raise FileNotFoundError(
+                    f"Failed to download or extract data for {extracted_data_file}. Error: {e}"
+                )
+    
+    # Initialize dataset: either from the extracted file or using synthetic data.
+    if extracted_data_file.exists():
+        dataset = Seq2SeqDataset(str(extracted_data_file), num_samples, allow_synthetic_data)
+    elif allow_synthetic_data:
+        dataset = Seq2SeqDataset(None, num_samples, allow_synthetic_data)
+    else:
+        # This case should be covered by checks above, but as a final safeguard
+        raise FileNotFoundError(
+            f"Data file '{extracted_data_file}' not found and synthetic data is not allowed."
+        )
+
+    # Update config with actual token counts and max sequence lengths from the dataset
+    # This is crucial for `build_model` if it's called later or expects these.
+    # A robust FL setup might pass these through the server config explicitly.
+    config["model_kwargs"]["num_encoder_tokens"] = dataset.num_encoder_tokens
+    config["model_kwargs"]["num_decoder_tokens"] = dataset.num_decoder_tokens
+    config["max_encoder_seq_length"] = dataset.max_encoder_seq_length
+    config["max_decoder_seq_length"] = dataset.max_decoder_seq_length
+
+
+    # Split dataset into training and validation sets
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    if split == "train":
+        return DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    elif split == "val":
+        return DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    else:
+        raise ValueError(f"Invalid split: {split}. Must be 'train' or 'val'.")
+
+
+# --- Training Step ---
+
+def train_step(model: nn.Module, batch: tuple, optimizer: torch.optim.Optimizer, config: dict) -> torch.Tensor:
+    """
+    Performs one forward pass and computes the loss.
+    Does NOT call loss.backward() or optimizer.step().
+    """
+    device = next(model.parameters()).device # Get the device where model parameters are
+
+    encoder_input_data, decoder_input_data, decoder_target_data = batch
+    
+    # Move batch tensors to the model's device
+    encoder_input_data = encoder_input_data.to(device)
+    decoder_input_data = decoder_input_data.to(device)
+    decoder_target_data = decoder_target_data.to(device)
+
+    # Forward pass
+    outputs = model(encoder_input_data, decoder_input_data)
+    
+    # Calculate loss
+    # outputs shape: (batch_size, max_decoder_seq_length, num_decoder_tokens) (logits)
+    # decoder_target_data shape: (batch_size, max_decoder_seq_length, num_decoder_tokens) (one-hot)
+
+    # nn.CrossEntropyLoss expects input as (N, C, ...) and target as (N, ...),
+    # where C is the number of classes, and target contains class indices (not one-hot).
+    
+    N, L, C = outputs.shape
+    
+    # Reshape outputs to (N*L, C) for CrossEntropyLoss
+    outputs_reshaped = outputs.view(N * L, C)
+    
+    # Convert one-hot target to class indices by taking argmax along the token dimension
+    # Then reshape to (N*L)
+    target_indices = torch.argmax(decoder_target_data, dim=-1) # (N, L)
+    target_indices_reshaped = target_indices.view(N * L) # (N*L)
+    
+    # Compute Cross-Entropy Loss
+    loss = F.cross_entropy(outputs_reshaped, target_indices_reshaped, reduction='mean')
+    
+    return loss

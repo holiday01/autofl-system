@@ -1,0 +1,135 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, random_split, TensorDataset
+import os
+
+
+# 1. build_model(config: dict) -> torch.nn.Module
+class Net(nn.Module):
+    def __init__(self, **kwargs):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        output = F.log_softmax(x, dim=1)
+        return output
+
+def build_model(config: dict) -> torch.nn.Module:
+    """
+    Instantiate and return the model.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    return Net(**model_kwargs)
+
+
+# 2. build_dataloader(config: dict, split: str = "train") -> DataLoader
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    allow_synthetic_data = config.get("allow_synthetic_data", False)
+    
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+
+    full_dataset = None
+    try:
+        # Load the full MNIST training dataset to be split locally
+        full_dataset = datasets.MNIST(
+            root=data_path, train=True, download=True, transform=transform
+        )
+    except FileNotFoundError:
+        if allow_synthetic_data:
+            print(f"MNIST dataset not found at {data_path}. Generating synthetic data.")
+            # Number of synthetic samples can be configured
+            num_samples = config.get("synthetic_data_samples", 5000) 
+            
+            # Generate synthetic images and labels using torch.randn/randint.
+            # Images are float tensors, mimicking the output shape (C, H, W) and range [0,1]
+            # after ToTensor, then applying Normalize manually.
+            synthetic_images = torch.rand(num_samples, 1, 28, 28) # Values between 0 and 1
+            synthetic_labels = torch.randint(0, 10, (num_samples,))
+
+            # Apply normalization: (x - mean) / std
+            mean = 0.1307
+            std = 0.3081
+            synthetic_images = (synthetic_images - mean) / std
+
+            full_dataset = TensorDataset(synthetic_images, synthetic_labels)
+        else:
+            raise FileNotFoundError(
+                f"MNIST dataset not found at {data_path}. Set 'allow_synthetic_data: true' in config "
+                f"to use synthetic data or ensure the dataset is available."
+            )
+
+    # Split the dataset into train and validation parts for the client's local use
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    
+    # We use random_split to create train/val subsets from the client's single dataset.
+    # Note: For real FL, a fixed generator seed might be preferred for reproducibility of splits
+    # across client restarts, or specific partitioning strategies would be used beforehand.
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+    if split == "train":
+        dataset_to_load = train_dataset
+        shuffle = True
+    elif split == "val":
+        dataset_to_load = val_dataset
+        shuffle = False # Typically, validation data is not shuffled
+    else:
+        raise ValueError(f"Invalid split: {split}. Expected 'train' or 'val'.")
+
+    return DataLoader(dataset_to_load, batch_size=batch_size, shuffle=shuffle)
+
+
+# 3. train_step(model, batch, optimizer, config: dict) -> torch.Tensor
+def train_step(model: torch.nn.Module, batch, optimizer, config: dict) -> torch.Tensor:
+    """
+    Run ONE forward pass only. Return the loss tensor WITH grad attached.
+    Do NOT call loss.backward() or optimizer.step().
+    """
+    model.train() # Ensure model is in training mode
+
+    # Determine the device of the model parameters
+    device = next(model.parameters()).device
+    
+    # Move batch data to the model's device
+    data, target = batch
+    data, target = data.to(device), target.to(device)
+
+    # Zero the gradients (FL runtime might do this, but good practice for clarity)
+    # optimizer.zero_grad() # This is handled by the FL runtime
+
+    # Forward pass
+    output = model(data)
+    
+    # Calculate loss
+    loss = F.nll_loss(output, target)
+
+    # Return the loss tensor with its computation graph intact.
+    # The FL runtime will handle `loss.backward()` and `optimizer.step()`.
+    return loss

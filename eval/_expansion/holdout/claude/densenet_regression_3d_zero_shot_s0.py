@@ -1,0 +1,96 @@
+import os
+import numpy as np
+import torch
+from monai.data import DataLoader, ImageDataset
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirst,
+    RandRotate90,
+    Resize,
+    ScaleIntensity,
+)
+from monai.networks.nets import Regressor
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    in_shape = config.get("in_shape", [1, 96, 96, 96])
+    out_shape = config.get("out_shape", 1)
+    channels = config.get("channels", (16, 32, 64, 128, 256))
+    strides = config.get("strides", (2, 2, 2, 2))
+
+    model = Regressor(
+        in_shape=in_shape,
+        out_shape=out_shape,
+        channels=channels,
+        strides=strides,
+    )
+    device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    model.to(device)
+    return model
+
+
+def build_dataloader(config: dict, split: str) -> DataLoader:
+    root_dir = config["data_dir"]
+    image_files = config["image_files"]
+    labels = np.array(config["labels"])
+
+    n_total = len(image_files)
+    split_ratio = config.get("train_split_ratio", 0.5)
+    n_train = int(n_total * split_ratio)
+
+    image_paths = [os.path.join(root_dir, "ixi", f) for f in image_files]
+
+    spatial_size = config.get("spatial_size", (96, 96, 96))
+
+    if split == "train":
+        transforms = Compose([
+            ScaleIntensity(),
+            EnsureChannelFirst(),
+            Resize(spatial_size),
+            RandRotate90(),
+        ])
+        files = image_paths[:n_train]
+        targets = labels[:n_train]
+        shuffle = True
+    elif split in ("val", "validation"):
+        transforms = Compose([
+            ScaleIntensity(),
+            EnsureChannelFirst(),
+            Resize(spatial_size),
+        ])
+        files = image_paths[n_train:]
+        targets = labels[n_train:]
+        shuffle = False
+    else:
+        raise ValueError(f"Unknown split '{split}'; expected 'train' or 'val'.")
+
+    dataset = ImageDataset(image_files=files, labels=targets, transform=transforms)
+    pin_memory = torch.cuda.is_available()
+    loader = DataLoader(
+        dataset,
+        batch_size=config.get("batch_size", 2),
+        shuffle=shuffle,
+        num_workers=config.get("num_workers", 2),
+        pin_memory=pin_memory,
+    )
+    return loader
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch: tuple,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> float:
+    device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    loss_fn = torch.nn.MSELoss()
+
+    inputs, labels = batch[0].to(device), batch[1].to(device)
+
+    optimizer.zero_grad()
+    outputs = model(inputs)
+    loss = loss_fn(outputs, labels.float().unsqueeze(-1) if outputs.shape != labels.shape else labels.float())
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()

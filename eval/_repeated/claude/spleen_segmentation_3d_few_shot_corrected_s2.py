@@ -1,0 +1,184 @@
+"""
+Auto-generated FL client module.
+Original script: MONAI 3D segmentation training (UNet + DiceLoss on NIfTI volumes).
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+from glob import glob
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
+import monai
+from monai.data import list_data_collate
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirstd,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+
+
+# ── Synthetic fallback dataset ───────────────────────────────────────────────
+
+class SyntheticNiftiDataset(Dataset):
+    """In-memory synthetic 3D volume dataset used when no real data path is given."""
+
+    def __init__(self, n: int = 40, spatial_size: tuple = (96, 96, 96)):
+        self.n = n
+        self.spatial_size = spatial_size
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        img = torch.randn(1, *self.spatial_size, dtype=torch.float32)
+        seg = (torch.randn(1, *self.spatial_size) > 0).float()
+        return {"img": img, "seg": seg}
+
+
+def _build_file_dataset(data_path: str, split: str, config: dict):
+    """Return a MONAI file-backed Dataset for the given split."""
+    images = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+    segs   = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+    n_total = len(images)
+    if n_total == 0:
+        return None
+
+    val_ratio = config.get("val_ratio", 0.2)
+    n_val = max(1, int(n_total * val_ratio))
+    n_train = n_total - n_val
+    if split == "train":
+        files = [{"img": img, "seg": seg}
+                 for img, seg in zip(images[:n_train], segs[:n_train])]
+        transforms = _train_transforms(config)
+    else:
+        files = [{"img": img, "seg": seg}
+                 for img, seg in zip(images[n_train:], segs[n_train:])]
+        transforms = _val_transforms()
+
+    return monai.data.Dataset(data=files, transform=transforms)
+
+
+def _train_transforms(config: dict) -> Compose:
+    spatial_size = config.get("spatial_size", [96, 96, 96])
+    num_samples  = config.get("num_samples", 4)
+    return Compose([
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        ScaleIntensityd(keys="img"),
+        RandCropByPosNegLabeld(
+            keys=["img", "seg"],
+            label_key="seg",
+            spatial_size=spatial_size,
+            pos=1,
+            neg=1,
+            num_samples=num_samples,
+        ),
+        RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+    ])
+
+
+def _val_transforms() -> Compose:
+    return Compose([
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        ScaleIntensityd(keys="img"),
+    ])
+
+
+# ── FL Interface ─────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    spatial_dims  = kwargs.get("spatial_dims", 3)
+    in_channels   = kwargs.get("in_channels", 1)
+    out_channels  = kwargs.get("out_channels", 1)
+    channels      = tuple(kwargs.get("channels", (16, 32, 64, 128, 256)))
+    strides       = tuple(kwargs.get("strides", (2, 2, 2, 2)))
+    num_res_units = kwargs.get("num_res_units", 2)
+    return monai.networks.nets.UNet(
+        spatial_dims=spatial_dims,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        channels=channels,
+        strides=strides,
+        num_res_units=num_res_units,
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 2))
+    num_workers = local.get("num_workers", config.get("num_workers", 4))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", "")
+    dataset = _build_file_dataset(data_path, split, config) if data_path else None
+
+    if dataset is None:
+        spatial_size = tuple(config.get("spatial_size", [96, 96, 96]))
+        n = config.get("synthetic_n", 40)
+        dataset = SyntheticNiftiDataset(n=n, spatial_size=spatial_size)
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+            num_workers=0,
+        )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        collate_fn=list_data_collate,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list | dict,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, dict):
+        inputs = batch.get("img", batch.get("image", batch.get("input")))
+        labels = batch.get("seg", batch.get("label", batch.get("target")))
+        if isinstance(inputs, torch.Tensor):
+            inputs = inputs.to(device)
+        if isinstance(labels, torch.Tensor):
+            labels = labels.to(device)
+    elif isinstance(batch, (list, tuple)):
+        inputs, labels = batch[0].to(device), batch[1].to(device)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    loss_fn = monai.losses.DiceLoss(sigmoid=True)
+    loss = loss_fn(outputs, labels)
+    return loss

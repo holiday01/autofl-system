@@ -1,0 +1,233 @@
+```python
+# Copyright (c) MONAI Consortium
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import sys
+import tempfile
+from glob import glob
+
+import torch
+from PIL import Image
+from torch.utils.data import Dataset, random_split
+from torch.utils.tensorboard import SummaryWriter
+
+import monai
+from monai.data import ArrayDataset, create_test_image_2d, decollate_batch, DataLoader
+from monai.inferers import sliding_window_inference
+from monai.metrics import DiceMetric
+from monai.transforms import (
+    Activations,
+    AsDiscrete,
+    Compose,
+    LoadImage,
+    RandRotate90,
+    RandSpatialCrop,
+    ScaleIntensity,
+)
+from monai.visualize import plot_2d_or_3d_image
+
+
+# ---------------------------------------------------------------------------
+# Internal dataset helpers
+# ---------------------------------------------------------------------------
+
+class _PathPairDataset(Dataset):
+    """Stores raw (image_path, seg_path) pairs; transforms are applied later
+    by _TransformSubset so that train and val splits can use different pipelines
+    over the same index partition."""
+
+    def __init__(self, image_paths, seg_paths):
+        assert len(image_paths) == len(seg_paths), (
+            "image and segmentation path lists must have the same length"
+        )
+        self.image_paths = list(image_paths)
+        self.seg_paths = list(seg_paths)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        return self.image_paths[idx], self.seg_paths[idx]
+
+
+class _TransformSubset(Dataset):
+    """Wraps a random_split Subset of _PathPairDataset and applies MONAI
+    transforms at item-fetch time, satisfying the requirement to use MONAI
+    transforms inside the Dataset class."""
+
+    def __init__(self, subset, img_transform, seg_transform):
+        self._subset = subset
+        self.img_transform = img_transform
+        self.seg_transform = seg_transform
+
+    def __len__(self):
+        return len(self._subset)
+
+    def __getitem__(self, idx):
+        img_path, seg_path = self._subset[idx]
+        return self.img_transform(img_path), self.seg_transform(seg_path)
+
+
+class _SyntheticSegDataset(Dataset):
+    """Synthetic 2D segmentation tensors (C=1, H=96, W=96).
+    Only used when config['allow_synthetic_data'] is explicitly True."""
+
+    def __init__(self, length: int = 40):
+        self.length = length
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        img = torch.randn(1, 96, 96)
+        seg = torch.randint(0, 2, (1, 96, 96)).float()
+        return img, seg
+
+
+# ---------------------------------------------------------------------------
+# FL client API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate the MONAI 2-D UNet.
+
+    Supported model_kwargs keys (all optional, with the original defaults):
+        spatial_dims, in_channels, out_channels, channels, strides, num_res_units
+    """
+    kwargs = config.get("model_kwargs", {})
+    model = monai.networks.nets.UNet(
+        spatial_dims=kwargs.get("spatial_dims", 2),
+        in_channels=kwargs.get("in_channels", 1),
+        out_channels=kwargs.get("out_channels", 1),
+        channels=tuple(kwargs.get("channels", (16, 32, 64, 128, 256))),
+        strides=tuple(kwargs.get("strides", (2, 2, 2, 2))),
+        num_res_units=kwargs.get("num_res_units", 2),
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split.
+
+    Config keys consumed:
+        config["local"]["batch_size"]     – default 16
+        config["data_path"]               – directory containing img*.png / seg*.png
+        config["allow_synthetic_data"]    – must be True to permit synthetic fallback
+
+    The full dataset (real or synthetic) is partitioned 80 / 20 (train / val)
+    using random_split with a fixed seed so both splits are always consistent.
+    MONAI transforms are applied inside the Dataset subclass, not in the
+    collation pipeline, preserving spatial-transform correctness.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+
+    # --- MONAI transform pipelines (identical to the original script) ------
+    train_imtrans = Compose(
+        [
+            LoadImage(image_only=True, ensure_channel_first=True),
+            ScaleIntensity(),
+            RandSpatialCrop((96, 96), random_size=False),
+            RandRotate90(prob=0.5, spatial_axes=(0, 1)),
+        ]
+    )
+    train_segtrans = Compose(
+        [
+            LoadImage(image_only=True, ensure_channel_first=True),
+            ScaleIntensity(),
+            RandSpatialCrop((96, 96), random_size=False),
+            RandRotate90(prob=0.5, spatial_axes=(0, 1)),
+        ]
+    )
+    val_imtrans = Compose(
+        [LoadImage(image_only=True, ensure_channel_first=True), ScaleIntensity()]
+    )
+    val_segtrans = Compose(
+        [LoadImage(image_only=True, ensure_channel_first=True), ScaleIntensity()]
+    )
+    # -----------------------------------------------------------------------
+
+    images = sorted(glob(os.path.join(data_path, "img*.png")))
+    segs = sorted(glob(os.path.join(data_path, "seg*.png")))
+
+    if not images or not segs:
+        # ----- synthetic fallback (must be explicitly opted in) ------------
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"No PNG files matching 'img*.png' / 'seg*.png' found under "
+                f"'{data_path}'. Provide real data or set "
+                "config['allow_synthetic_data'] = True to use synthetic tensors."
+            )
+        full_ds = _SyntheticSegDataset(length=40)
+        n_train = int(0.8 * len(full_ds))
+        n_val = len(full_ds) - n_train
+        train_subset, val_subset = random_split(
+            full_ds,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(42),
+        )
+        chosen = train_subset if split == "train" else val_subset
+
+    else:
+        # ----- real data path ----------------------------------------------
+        base_ds = _PathPairDataset(images, segs)
+        n_train = int(0.8 * len(base_ds))
+        n_val = len(base_ds) - n_train
+        train_subset, val_subset = random_split(
+            base_ds,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(42),
+        )
+        if split == "train":
+            chosen = _TransformSubset(train_subset, train_imtrans, train_segtrans)
+        else:
+            chosen = _TransformSubset(val_subset, val_imtrans, val_segtrans)
+
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Run one forward pass and return the loss tensor with grad attached.
+
+    The FL runtime is responsible for loss.backward() and optimizer.step();
+    this function must NOT call either.
+    """
+    loss_fn = monai.losses.DiceLoss(sigmoid=True)
+    device = next(model.parameters()).device
+    inputs = batch[0].to(device)
+    labels = batch[1].to(device)
+    outputs = model(inputs)
+    loss = loss_fn(outputs, labels)
+    return loss
+```
+
+### What changed and why
+
+| Concern | Decision |
+|---|---|
+| **`build_model`** | Reads every UNet constructor arg from `config["model_kwargs"]`, falling back to the original defaults so existing configs need no changes. |
+| **`build_dataloader` — split** | A single `_PathPairDataset` (paths only, no transforms) is created over all found files, then `random_split` (80/20, seed 42) produces deterministic train/val index sets. Each subset is wrapped in `_TransformSubset`, which applies the appropriate MONAI pipeline at `__getitem__` time — satisfying the "wrap MONAI transforms in the Dataset class" rule and ensuring augmentation only runs on training samples. |
+| **`build_dataloader` — synthetic gate** | `FileNotFoundError` is raised when no PNG files are found and `allow_synthetic_data` is `False` (the default). The `_SyntheticSegDataset` is only constructed after the flag is confirmed `True`. |
+| **`train_step`** | One forward pass + `DiceLoss`. Returns the loss tensor *with gradient*. `loss.backward()` and `optimizer.step()` are intentionally absent — the FL runtime owns the backward pass. |
+| **Imports** | All original imports are preserved; `torch.utils.data.Dataset` and `random_split` are added to support the FL split logic. |

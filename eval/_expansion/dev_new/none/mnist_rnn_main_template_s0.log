@@ -1,0 +1,14 @@
+/home/holiday01/.pyenv/versions/3.11.9/lib/python3.11/site-packages/torch/nn/modules/dropout.py:176: UserWarning: dropout2d: Received a 2-D input to dropout2d, which is deprecated and will result in an error in a future release. To retain the behavior and silence this warning, please use dropout instead. Note that dropout2d exists to provide channel-wise dropout on inputs with 2 spatial dimensions, a channel dimension, and an optional batch dimension (i.e. 3D or 4D inputs).
+  return F.dropout2d(input, self.p, self.training, self.inplace)
+  Preflight [eval-client]: PASS  (2.0s)
+  Preflight [eval-site-1]: PASS
+
+Starting FL: 1 rounds, 1 clients
+==================================================
+
+Round 1/1
+    [eval-site-1] loss=0.9254  steps=13500  n=54000  53.63s
+  Aggregated loss: 0.9254  (53.67s)
+
+FL training complete.
+EVALJSON {"syntax_valid": true, "interface_complete": true, "build_model_present": true, "build_dataloader_present": true, "train_step_present": true, "optimizer_detected": true, "preflight_pass": true, "e2e_runnable": true, "error_stage": "", "error_message": "", "elapsed_sec": 55.71, "data_path": ".", "data_path_exists": true, "strict_data": false, "spec_version": "n/a", "dataset_class": "MNIST", "dataset_len": 60000, "component_coverage": 1.0}

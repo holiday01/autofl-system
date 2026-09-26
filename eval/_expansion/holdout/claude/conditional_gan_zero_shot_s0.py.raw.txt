@@ -1,0 +1,135 @@
+```python
+import keras
+import numpy as np
+import tensorflow as tf
+from keras import layers, ops
+
+
+def build_model(config):
+    num_classes = config.get("num_classes", 10)
+    num_channels = config.get("num_channels", 1)
+    latent_dim = config.get("latent_dim", 128)
+    image_size = config.get("image_size", 28)
+
+    generator_in_channels = latent_dim + num_classes
+    discriminator_in_channels = num_channels + num_classes
+
+    discriminator = keras.Sequential(
+        [
+            keras.layers.InputLayer((image_size, image_size, discriminator_in_channels)),
+            layers.Conv2D(64, (3, 3), strides=(2, 2), padding="same"),
+            layers.LeakyReLU(negative_slope=0.2),
+            layers.Conv2D(128, (3, 3), strides=(2, 2), padding="same"),
+            layers.LeakyReLU(negative_slope=0.2),
+            layers.GlobalMaxPooling2D(),
+            layers.Dense(1),
+        ],
+        name="discriminator",
+    )
+
+    generator = keras.Sequential(
+        [
+            keras.layers.InputLayer((generator_in_channels,)),
+            layers.Dense(7 * 7 * generator_in_channels),
+            layers.LeakyReLU(negative_slope=0.2),
+            layers.Reshape((7, 7, generator_in_channels)),
+            layers.Conv2DTranspose(128, (4, 4), strides=(2, 2), padding="same"),
+            layers.LeakyReLU(negative_slope=0.2),
+            layers.Conv2DTranspose(128, (4, 4), strides=(2, 2), padding="same"),
+            layers.LeakyReLU(negative_slope=0.2),
+            layers.Conv2D(1, (7, 7), padding="same", activation="sigmoid"),
+        ],
+        name="generator",
+    )
+
+    return {"generator": generator, "discriminator": discriminator}
+
+
+def build_dataloader(config, split):
+    num_classes = config.get("num_classes", 10)
+    batch_size = config.get("batch_size", 64)
+
+    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+
+    if split == "train":
+        images, labels = x_train, y_train
+    elif split == "test":
+        images, labels = x_test, y_test
+    else:
+        images = np.concatenate([x_train, x_test])
+        labels = np.concatenate([y_train, y_test])
+
+    images = images.astype("float32") / 255.0
+    images = np.reshape(images, (-1, 28, 28, 1))
+    labels = keras.utils.to_categorical(labels, num_classes)
+
+    dataset = tf.data.Dataset.from_tensor_slices((images, labels))
+    dataset = dataset.shuffle(buffer_size=1024).batch(batch_size)
+    return dataset
+
+
+def train_step(model, batch, optimizer, config):
+    num_classes = config.get("num_classes", 10)
+    latent_dim = config.get("latent_dim", 128)
+    image_size = config.get("image_size", 28)
+
+    generator = model["generator"]
+    discriminator = model["discriminator"]
+    d_optimizer = optimizer["discriminator"]
+    g_optimizer = optimizer["generator"]
+    loss_fn = keras.losses.BinaryCrossentropy(from_logits=True)
+
+    real_images, one_hot_labels = batch
+
+    image_one_hot_labels = one_hot_labels[:, :, None, None]
+    image_one_hot_labels = ops.repeat(
+        image_one_hot_labels, repeats=[image_size * image_size]
+    )
+    image_one_hot_labels = ops.reshape(
+        image_one_hot_labels, (-1, image_size, image_size, num_classes)
+    )
+
+    batch_size = ops.shape(real_images)[0]
+    random_latent_vectors = keras.random.normal(shape=(batch_size, latent_dim))
+    random_vector_labels = ops.concatenate(
+        [random_latent_vectors, one_hot_labels], axis=1
+    )
+
+    generated_images = generator(random_vector_labels, training=True)
+
+    fake_image_and_labels = ops.concatenate(
+        [generated_images, image_one_hot_labels], -1
+    )
+    real_image_and_labels = ops.concatenate([real_images, image_one_hot_labels], -1)
+    combined_images = ops.concatenate(
+        [fake_image_and_labels, real_image_and_labels], axis=0
+    )
+
+    labels_d = ops.concatenate(
+        [ops.ones((batch_size, 1)), ops.zeros((batch_size, 1))], axis=0
+    )
+
+    with tf.GradientTape() as tape:
+        predictions = discriminator(combined_images, training=True)
+        d_loss = loss_fn(labels_d, predictions)
+    grads = tape.gradient(d_loss, discriminator.trainable_weights)
+    d_optimizer.apply_gradients(zip(grads, discriminator.trainable_weights))
+
+    random_latent_vectors = keras.random.normal(shape=(batch_size, latent_dim))
+    random_vector_labels = ops.concatenate(
+        [random_latent_vectors, one_hot_labels], axis=1
+    )
+    misleading_labels = ops.zeros((batch_size, 1))
+
+    with tf.GradientTape() as tape:
+        fake_images = generator(random_vector_labels, training=True)
+        fake_image_and_labels = ops.concatenate(
+            [fake_images, image_one_hot_labels], -1
+        )
+        predictions = discriminator(fake_image_and_labels, training=False)
+        g_loss = loss_fn(misleading_labels, predictions)
+    grads = tape.gradient(g_loss, generator.trainable_weights)
+    g_optimizer.apply_gradients(zip(grads, generator.trainable_weights))
+
+    return {"g_loss": float(g_loss), "d_loss": float(d_loss)}
+```

@@ -1,0 +1,256 @@
+```python
+# Copyright (c) MONAI Consortium
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import sys
+import tempfile
+from glob import glob
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.tensorboard import SummaryWriter
+
+import monai
+from monai.data import create_test_image_3d, list_data_collate, decollate_batch
+from monai.inferers import sliding_window_inference
+from monai.metrics import DiceMetric
+from monai.transforms import (
+    Activations,
+    EnsureChannelFirstd,
+    AsDiscrete,
+    Compose,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+from monai.visualize import plot_2d_or_3d_image
+
+
+# ---------------------------------------------------------------------------
+# Module-level transforms (stateless; shared across dataloader calls)
+# ---------------------------------------------------------------------------
+
+_train_transforms = Compose(
+    [
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        ScaleIntensityd(keys="img"),
+        RandCropByPosNegLabeld(
+            keys=["img", "seg"],
+            label_key="seg",
+            spatial_size=[96, 96, 96],
+            pos=1,
+            neg=1,
+            num_samples=4,
+        ),
+        RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+    ]
+)
+
+_val_transforms = Compose(
+    [
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        ScaleIntensityd(keys="img"),
+    ]
+)
+
+_dice_loss = monai.losses.DiceLoss(sigmoid=True)
+
+
+# ---------------------------------------------------------------------------
+# Helper datasets
+# ---------------------------------------------------------------------------
+
+class _IndexDataset(Dataset):
+    """Proxy dataset that returns its own integer index.
+    Used exclusively with random_split to obtain reproducible,
+    randomly permuted index assignments without loading any real data."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, idx: int) -> int:
+        return idx
+
+
+class _SyntheticSegDataset(Dataset):
+    """Returns random (image, segmentation) tensor pairs in MONAI dict format.
+
+    This dataset is used ONLY when config['allow_synthetic_data'] is True
+    and no real NIfTI data is found on disk.  It deliberately bypasses
+    MONAI's file-loading transforms and produces tensors already in the
+    expected shape [C, H, W, D].
+    """
+
+    def __init__(self, length: int, spatial_size: tuple = (96, 96, 96)) -> None:
+        self.length = length
+        self.spatial_size = spatial_size
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int) -> dict:
+        img = torch.randn(1, *self.spatial_size)
+        seg = torch.randint(0, 2, (1, *self.spatial_size)).float()
+        return {"img": img, "seg": seg}
+
+
+# ---------------------------------------------------------------------------
+# FL client API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate and return the 3-D segmentation UNet.
+
+    Supported keys inside config['model_kwargs'] (all optional):
+        spatial_dims  (int)   : default 3
+        in_channels   (int)   : default 1
+        out_channels  (int)   : default 1
+        channels      (tuple) : default (16, 32, 64, 128, 256)
+        strides       (tuple) : default (2, 2, 2, 2)
+        num_res_units (int)   : default 2
+    """
+    kwargs = config.get("model_kwargs", {})
+    model = monai.networks.nets.UNet(
+        spatial_dims=kwargs.get("spatial_dims", 3),
+        in_channels=kwargs.get("in_channels", 1),
+        out_channels=kwargs.get("out_channels", 1),
+        channels=tuple(kwargs.get("channels", (16, 32, 64, 128, 256))),
+        strides=tuple(kwargs.get("strides", (2, 2, 2, 2))),
+        num_res_units=kwargs.get("num_res_units", 2),
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for *split* ('train' or 'val').
+
+    Config keys consumed:
+        data_path              (str)  – directory containing img*.nii.gz /
+                                        seg*.nii.gz pairs
+        local.batch_size       (int)  – mini-batch size for training
+                                        (val is always batch_size=1)
+        allow_synthetic_data   (bool) – MUST be True to permit synthetic
+                                        fallback when real data is absent;
+                                        raises FileNotFoundError otherwise
+
+    The train/val split is produced via torch.utils.data.random_split so
+    that every FL round uses the same seeded partition when the global
+    random state is fixed by the FL runtime.
+    """
+    data_path = config.get("data_path", ".")
+    batch_size = config.get("local", {}).get("batch_size", 16)
+
+    images = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+    segs   = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+
+    # ------------------------------------------------------------------
+    # Synthetic fallback – ONLY when explicitly authorised
+    # ------------------------------------------------------------------
+    if not images or not segs:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"No NIfTI files matching 'img*.nii.gz' / 'seg*.nii.gz' were found "
+                f"under '{data_path}'. "
+                "Set config['allow_synthetic_data'] = True to fall back to synthetic "
+                "data, or point config['data_path'] at a directory with real images."
+            )
+        total   = 40
+        n_train = int(0.8 * total)
+        n_val   = total - n_train
+        if split == "train":
+            ds = _SyntheticSegDataset(n_train)
+            return DataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=torch.cuda.is_available(),
+            )
+        else:
+            ds = _SyntheticSegDataset(n_val)
+            return DataLoader(ds, batch_size=1, num_workers=0)
+
+    # ------------------------------------------------------------------
+    # Real data path
+    # ------------------------------------------------------------------
+    all_files = [
+        {"img": img, "seg": seg} for img, seg in zip(images, segs)
+    ]
+    n_total = len(all_files)
+    n_val   = max(1, int(0.2 * n_total))
+    n_train = n_total - n_val
+
+    # Use an index-proxy dataset so random_split gives us shuffled index
+    # assignments; iterating a Subset calls dataset[i] which returns i.
+    idx_ds = _IndexDataset(n_total)
+    train_idx_sub, val_idx_sub = random_split(idx_ds, [n_train, n_val])
+
+    train_files = [all_files[i] for i in train_idx_sub]
+    val_files   = [all_files[i] for i in val_idx_sub]
+
+    if split == "train":
+        ds = monai.data.Dataset(data=train_files, transform=_train_transforms)
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            collate_fn=list_data_collate,
+            pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        ds = monai.data.Dataset(data=val_files, transform=_val_transforms)
+        return DataLoader(
+            ds,
+            batch_size=1,
+            num_workers=4,
+            collate_fn=list_data_collate,
+        )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch: dict,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Run one forward pass and return the scalar DiceLoss with grad attached.
+
+    The FL runtime is solely responsible for loss.backward() and
+    optimizer.step(); neither is called here.
+    """
+    device = next(model.parameters()).device
+    inputs = batch["img"].to(device)
+    labels = batch["seg"].to(device)
+    outputs = model(inputs)
+    loss = _dice_loss(outputs, labels)
+    return loss
+```
+
+### Design decisions worth noting
+
+| Concern | Decision |
+|---|---|
+| **Imports** | All original imports retained verbatim (SummaryWriter, nibabel, etc.) even though the training loop that used them was removed. |
+| **`random_split` with per-split transforms** | A lightweight `_IndexDataset` is split first to obtain randomly permuted index assignments; two separate `monai.data.Dataset` instances are then built from the resulting file sub-lists, each carrying the correct transforms. This avoids accidentally applying train augmentations to val data. |
+| **Synthetic fallback** | `_SyntheticSegDataset` produces `[1, 96, 96, 96]` tensors in MONAI dict format, bypassing `LoadImaged`. It is **only reachable** when `config["allow_synthetic_data"] is True`; otherwise `FileNotFoundError` is raised immediately. |
+| **`_dice_loss` at module level** | `DiceLoss` is a stateless `nn.Module` with no learnable parameters; creating it once at import time avoids repeated allocation per step. |
+| **`train_step`** | Single forward pass only — no `loss.backward()`, no `optimizer.step()`. Tensors are moved to the device inferred from model parameters. |

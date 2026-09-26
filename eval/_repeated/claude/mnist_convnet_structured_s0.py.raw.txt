@@ -1,0 +1,167 @@
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+try:
+    import torchvision
+    import torchvision.transforms as transforms
+    HAS_TORCHVISION = True
+except ImportError:
+    HAS_TORCHVISION = False
+
+
+# ── Model ──────────────────────────────────────────────────────────────────
+# Converted from Keras Sequential (TF/Keras → torch.nn.Module).
+# Original architecture:
+#   Input(28,28,1) → Conv2D(32,3x3,relu) → MaxPooling2D(2x2)
+#             → Conv2D(64,3x3,relu) → MaxPooling2D(2x2)
+#             → Flatten → Dropout(0.5) → Dense(10, softmax)
+#
+# The final layer emits raw logits; train_step uses F.cross_entropy, which is
+# numerically equivalent to softmax + categorical_crossentropy.
+
+class MNISTConvNet(nn.Module):
+    def __init__(self, num_classes: int = 10, dropout: float = 0.5):
+        super().__init__()
+        # (N, 1, 28, 28)
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3),   # → (N, 32, 26, 26)
+            nn.ReLU(),
+            nn.MaxPool2d(2),                   # → (N, 32, 13, 13)
+            nn.Conv2d(32, 64, kernel_size=3),  # → (N, 64, 11, 11)
+            nn.ReLU(),
+            nn.MaxPool2d(2),                   # → (N, 64,  5,  5)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),                      # → (N, 1600)
+            nn.Dropout(dropout),
+            nn.Linear(64 * 5 * 5, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(x))
+
+
+# ── FL API ─────────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """Instantiate and return the MNISTConvNet.
+
+    Supported model_kwargs: num_classes (default 10), dropout (default 0.5).
+    """
+    kwargs = config.get("model_kwargs", {})
+    return MNISTConvNet(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split ('train' or 'val').
+
+    Config keys consumed:
+      local.batch_size  – batch size (default 16)
+      data_path         – root directory for MNIST download cache (default '.')
+      val_fraction      – fraction of training data used for val (default 0.1)
+      allow_synthetic_data – must be True to fall back to random tensors
+    """
+    batch_size   = config.get("local", {}).get("batch_size", 16)
+    data_path    = config.get("data_path", ".")
+    val_fraction = config.get("val_fraction", 0.1)
+
+    full_dataset = _load_mnist(data_path, config)
+
+    n_total = len(full_dataset)
+    n_val   = max(1, int(n_total * val_fraction))
+    n_train = n_total - n_val
+
+    train_ds, val_ds = random_split(
+        full_dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen = train_ds if split == "train" else val_ds
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        drop_last=False,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Run ONE forward pass and return the loss tensor (grad attached).
+
+    The FL runtime is responsible for loss.backward() and optimizer.step().
+    """
+    device = next(model.parameters()).device
+    inputs, targets = batch
+    inputs  = inputs.to(device)
+    targets = targets.to(device)
+
+    logits = model(inputs)
+    loss   = F.cross_entropy(logits, targets)   # equivalent to softmax + CCE
+    return loss                                 # grad attached; no backward here
+
+
+# ── Internal helpers ───────────────────────────────────────────────────────
+
+def _load_mnist(data_path: str, config: dict) -> TensorDataset:
+    """Try real MNIST; fall back to synthetic only when explicitly allowed."""
+    if HAS_TORCHVISION:
+        transform = transforms.Compose([transforms.ToTensor()])
+        try:
+            return torchvision.datasets.MNIST(
+                root=data_path,
+                train=True,
+                download=False,
+                transform=transform,
+            )
+        except Exception as exc:
+            _require_synthetic_allowed(
+                config,
+                reason=f"MNIST dataset not found at '{data_path}' ({exc}). "
+                       "Run torchvision.datasets.MNIST(..., download=True) first.",
+            )
+            return _synthetic_dataset()
+    else:
+        _require_synthetic_allowed(
+            config,
+            reason="torchvision is not installed; cannot load real MNIST data.",
+        )
+        return _synthetic_dataset()
+
+
+def _require_synthetic_allowed(config: dict, reason: str) -> None:
+    """Raise FileNotFoundError unless allow_synthetic_data is explicitly True."""
+    if not config.get("allow_synthetic_data", False):
+        raise FileNotFoundError(
+            f"{reason} "
+            "Set config['allow_synthetic_data'] = True to use synthetic data "
+            "for smoke-testing only — never for real federated training."
+        )
+
+
+def _synthetic_dataset(n: int = 1000) -> TensorDataset:
+    """Return a synthetic MNIST-shaped dataset (smoke-test only)."""
+    x = torch.randn(n, 1, 28, 28)
+    y = torch.randint(0, 10, (n,))
+    return TensorDataset(x, y)
+```
+
+### What changed and why
+
+| Original (Keras) | FL module (PyTorch) |
+|---|---|
+| `keras.Sequential` + `layers.*` | `MNISTConvNet(nn.Module)` – identical topology |
+| `keras.datasets.mnist.load_data()` at module level | `torchvision.datasets.MNIST` inside `build_dataloader`, lazy & path-aware |
+| One-hot labels via `to_categorical` | Integer class indices; `F.cross_entropy` handles softmax + CCE internally |
+| `model.fit(…, validation_split=0.1)` | `random_split(full_dataset, [n_train, n_val])` honouring `val_fraction` |
+| `model.compile / model.fit` | `train_step` returns the loss only; **no** `.backward()` or `.step()` |
+| Synthetic fallback | Gated strictly on `config["allow_synthetic_data"]`; raises `FileNotFoundError` otherwise |

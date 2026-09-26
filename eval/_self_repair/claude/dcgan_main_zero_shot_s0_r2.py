@@ -1,0 +1,219 @@
+from __future__ import print_function
+import torch
+import torch.nn as nn
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        torch.nn.init.normal_(m.weight, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        torch.nn.init.normal_(m.weight, 1.0, 0.02)
+        torch.nn.init.zeros_(m.bias)
+
+
+class Generator(nn.Module):
+    def __init__(self, nz, ngf, nc, ngpu):
+        super(Generator, self).__init__()
+        self.ngpu = ngpu
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, input):
+        if (input.is_cuda or input.is_xpu) and self.ngpu > 1:
+            return nn.parallel.data_parallel(self.main, input, range(self.ngpu))
+        return self.main(input)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, nc, ndf, ngpu):
+        super(Discriminator, self).__init__()
+        self.ngpu = ngpu
+        self.main = nn.Sequential(
+            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, input):
+        if (input.is_cuda or input.is_xpu) and self.ngpu > 1:
+            output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
+        else:
+            output = self.main(input)
+        return output.view(-1, 1).squeeze(1)
+
+
+class GANModel(nn.Module):
+    def __init__(self, netG, netD):
+        super(GANModel, self).__init__()
+        self.netG = netG
+        self.netD = netD
+        self.criterion = nn.BCELoss()
+
+    def forward(self, x):
+        return self.netD(x)
+
+
+def build_model(config):
+    nz = config.get('nz', 100)
+    ngf = config.get('ngf', 64)
+    ndf = config.get('ndf', 64)
+    nc = config.get('nc', 3)
+    ngpu = config.get('ngpu', 1)
+
+    netG = Generator(nz, ngf, nc, ngpu)
+    netG.apply(weights_init)
+    if config.get('netG', ''):
+        netG.load_state_dict(torch.load(config['netG']))
+
+    netD = Discriminator(nc, ndf, ngpu)
+    netD.apply(weights_init)
+    if config.get('netD', ''):
+        netD.load_state_dict(torch.load(config['netD']))
+
+    return GANModel(netG, netD)
+
+
+def build_dataloader(config, split='train'):
+    dataset_name = config.get('dataset', 'fake')
+    dataroot = config.get('dataroot', None)
+    image_size = config.get('imageSize', 64)
+    batch_size = config.get('batchSize', 64)
+    workers = config.get('workers', 2)
+
+    if dataroot is None and dataset_name.lower() != 'fake':
+        raise ValueError("`dataroot` is required for dataset '%s'" % dataset_name)
+
+    if dataset_name in ['imagenet', 'folder', 'lfw']:
+        dataset = dset.ImageFolder(
+            root=dataroot,
+            transform=transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]),
+        )
+    elif dataset_name == 'lsun':
+        classes = [c + '_train' for c in config.get('classes', 'bedroom').split(',')]
+        dataset = dset.LSUN(
+            root=dataroot,
+            classes=classes,
+            transform=transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]),
+        )
+    elif dataset_name == 'cifar10':
+        dataset = dset.CIFAR10(
+            root=dataroot,
+            train=(split == 'train'),
+            download=True,
+            transform=transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]),
+        )
+    elif dataset_name == 'mnist':
+        dataset = dset.MNIST(
+            root=dataroot,
+            train=(split == 'train'),
+            download=True,
+            transform=transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5,), (0.5,)),
+            ]),
+        )
+    elif dataset_name == 'fake':
+        nc = config.get('nc', 3)
+        dataset = dset.FakeData(
+            image_size=(nc, image_size, image_size),
+            transform=transforms.ToTensor(),
+        )
+    else:
+        raise ValueError("Unknown dataset: %s" % dataset_name)
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=workers,
+    )
+
+
+def train_step(model, batch, optimizer, config):
+    netG = model.netG
+    netD = model.netD
+    criterion = model.criterion
+    optimizerD = optimizer['optimizerD']
+    optimizerG = optimizer['optimizerG']
+
+    nz = config.get('nz', 100)
+    device = config.get('device', next(netG.parameters()).device)
+
+    real_cpu = batch[0].to(device)
+    batch_size = real_cpu.size(0)
+
+    netD.zero_grad()
+    label = torch.full((batch_size,), 1, dtype=real_cpu.dtype, device=device)
+    output = netD(real_cpu)
+    errD_real = criterion(output, label)
+    errD_real.backward()
+    D_x = output.mean().item()
+
+    noise = torch.randn(batch_size, nz, 1, 1, device=device)
+    fake = netG(noise)
+    label.fill_(0)
+    output = netD(fake.detach())
+    errD_fake = criterion(output, label)
+    errD_fake.backward()
+    D_G_z1 = output.mean().item()
+    errD = errD_real + errD_fake
+    optimizerD.step()
+
+    netG.zero_grad()
+    label.fill_(1)
+    output = netD(fake)
+    errG = criterion(output, label)
+    errG.backward()
+    D_G_z2 = output.mean().item()
+    optimizerG.step()
+
+    return {
+        'errD': errD.item(),
+        'errG': errG.item(),
+        'D_x': D_x,
+        'D_G_z1': D_G_z1,
+        'D_G_z2': D_G_z2,
+    }

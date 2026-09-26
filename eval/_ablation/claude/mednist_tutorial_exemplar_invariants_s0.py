@@ -1,0 +1,144 @@
+"""
+Auto-generated FL client module.
+Original script: MONAI 3D DenseNet121 classification (IXI T1 gender demo)
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+import monai
+from monai.data import ImageDataset
+from monai.transforms import Compose, EnsureChannelFirst, RandRotate90, Resize, ScaleIntensity
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return monai.networks.nets.DenseNet121(
+        spatial_dims=kwargs.get("spatial_dims", 3),
+        in_channels=kwargs.get("in_channels", 1),
+        out_channels=kwargs.get("out_channels", 2),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 2))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path   = config.get("data_path", ".")
+    val_ratio   = config.get("val_ratio", 0.5)
+    seed        = config.get("seed", 42)
+    spatial_size = tuple(config.get("spatial_size", [96, 96, 96]))
+    out_channels = config.get("model_kwargs", {}).get("out_channels", 2)
+
+    train_transforms = Compose([ScaleIntensity(), EnsureChannelFirst(), Resize(spatial_size), RandRotate90()])
+    val_transforms   = Compose([ScaleIntensity(), EnsureChannelFirst(), Resize(spatial_size)])
+    transforms = train_transforms if split == "train" else val_transforms
+
+    # Prefer explicit lists supplied in config
+    image_files = config.get("image_files", [])
+    labels      = config.get("labels", [])
+
+    # Discover from directory when not provided explicitly
+    if not image_files and os.path.isdir(data_path):
+        label_map = config.get("label_map", {})
+        for fname in sorted(os.listdir(data_path)):
+            if fname.endswith(".nii.gz"):
+                image_files.append(os.path.join(data_path, fname))
+                labels.append(label_map.get(fname, 0))
+
+    if not image_files:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"No .nii.gz files found under data_path='{data_path}' and no "
+                "'image_files' supplied in config. "
+                "Set config['allow_synthetic_data']=True to use synthetic data."
+            )
+        n = config.get("synthetic_n", 20)
+        X = torch.randn(n, 1, *spatial_size)
+        y = torch.randint(0, out_channels, (n,))
+        full_ds = TensorDataset(X, y)
+        n_val   = max(1, int(n * val_ratio))
+        n_train = n - n_val
+        train_ds, val_ds = random_split(
+            full_ds, [n_train, n_val],
+            generator=torch.Generator().manual_seed(seed),
+        )
+        ds = train_ds if split == "train" else val_ds
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+            num_workers=num_workers,
+            pin_memory=pin_memory and torch.cuda.is_available(),
+        )
+
+    # Deterministic train/val split by index
+    n = len(image_files)
+    rng = np.random.default_rng(seed)
+    indices  = rng.permutation(n).tolist()
+    n_val    = max(1, int(n * val_ratio))
+    chosen   = indices[n_val:] if split == "train" else indices[:n_val]
+
+    chosen_images = [image_files[i] for i in chosen]
+    chosen_labels = np.array([labels[i] for i in chosen], dtype=np.int64)
+
+    dataset = ImageDataset(
+        image_files=chosen_images,
+        labels=chosen_labels,
+        transform=transforms,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch   = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs  = batch[0]
+        targets = batch[1]
+    elif isinstance(batch, dict):
+        batch   = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    loss = nn.CrossEntropyLoss()(outputs, targets)
+    return loss

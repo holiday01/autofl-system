@@ -1,0 +1,420 @@
+# Copyright 2021 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# /// script
+# dependencies = [
+#     "transformers @ git+https://github.com/huggingface/transformers.git",
+#     "accelerate >= 0.12.0",
+#     "datasets >= 1.8.0",
+#     "sentencepiece != 0.1.92",
+#     "scipy",
+#     "scikit-learn",
+#     "protobuf",
+#     "torch >= 1.3",
+#     "evaluate",
+# ]
+# ///
+
+"""FL client module – GLUE Sequence Classification (derived from HuggingFace fine-tuning script)."""
+
+import argparse
+import json
+import logging
+import math
+import os
+import random
+from pathlib import Path
+
+import datasets
+import evaluate
+import torch
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import set_seed
+from datasets import load_dataset
+from huggingface_hub import HfApi
+from torch import nn
+from torch.utils.data import DataLoader, Dataset, random_split
+from tqdm.auto import tqdm
+
+import transformers
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    PreTrainedConfig,
+    SchedulerType,
+    default_data_collator,
+    get_scheduler,
+)
+from transformers.trainer_pt_utils import get_parameter_names
+from transformers.utils import check_min_version
+from transformers.utils.versions import require_version
+
+check_min_version("4.57.0.dev0")
+require_version(
+    "datasets>=1.8.0",
+    "To fix: pip install -r examples/pytorch/text-classification/requirements.txt",
+)
+
+task_to_keys = {
+    "cola": ("sentence", None),
+    "mnli": ("premise", "hypothesis"),
+    "mrpc": ("sentence1", "sentence2"),
+    "qnli": ("question", "sentence"),
+    "qqp": ("question1", "question2"),
+    "rte": ("sentence1", "sentence2"),
+    "sst2": ("sentence", None),
+    "stsb": ("sentence1", "sentence2"),
+    "wnli": ("sentence1", "sentence2"),
+}
+
+# Module-level tokenizer cache so build_model and build_dataloader share one instance.
+_tokenizer_cache: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _get_tokenizer(
+    model_name_or_path: str,
+    use_fast: bool = True,
+    trust_remote_code: bool = False,
+):
+    """Load (and process-wide cache) a tokenizer."""
+    cache_key = (model_name_or_path, use_fast, trust_remote_code)
+    if cache_key not in _tokenizer_cache:
+        tok = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            use_fast=use_fast,
+            trust_remote_code=trust_remote_code,
+        )
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        _tokenizer_cache[cache_key] = tok
+    return _tokenizer_cache[cache_key]
+
+
+class _HFDatasetWrapper(Dataset):
+    """Wraps a tokenised HuggingFace ``datasets.Dataset`` as a ``torch.utils.data.Dataset``."""
+
+    def __init__(self, hf_dataset):
+        self._ds = hf_dataset
+
+    def __len__(self):
+        return len(self._ds)
+
+    def __getitem__(self, idx):
+        item = self._ds[idx]
+        return {
+            k: v if isinstance(v, torch.Tensor) else torch.tensor(v)
+            for k, v in item.items()
+        }
+
+
+class _SyntheticGlueDataset(Dataset):
+    """Fixed-length synthetic dataset.
+
+    Only constructed when ``config['allow_synthetic_data'] is True``.
+    All sequences are already padded to ``seq_len``, so ``default_data_collator``
+    is used and no tokenizer is required.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        seq_len: int,
+        vocab_size: int,
+        num_labels: int,
+        is_regression: bool = False,
+    ):
+        self.size = size
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.num_labels = num_labels
+        self.is_regression = is_regression
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        sample = {
+            "input_ids": torch.randint(0, self.vocab_size, (self.seq_len,)),
+            "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
+        }
+        if self.is_regression:
+            sample["labels"] = torch.rand(()).float()
+        else:
+            sample["labels"] = torch.randint(0, max(self.num_labels, 2), ()).long()
+        return sample
+
+
+# ---------------------------------------------------------------------------
+# FL API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate and return an ``AutoModelForSequenceClassification`` model.
+
+    Config keys (all optional):
+        model_kwargs.model_name_or_path  (str)  HF model id or local path  [default "bert-base-uncased"]
+        model_kwargs.num_labels          (int)  number of output classes; inferred from task_name if omitted
+        model_kwargs.use_fast_tokenizer  (bool) [default True]
+        model_kwargs.trust_remote_code   (bool) [default False]
+        model_kwargs.ignore_mismatched_sizes (bool) [default False]
+        task_name                        (str)  GLUE task; used to infer num_labels when not set
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    model_name_or_path = model_kwargs.get("model_name_or_path", "bert-base-uncased")
+    task_name = config.get("task_name", None)
+    trust_remote_code = bool(model_kwargs.get("trust_remote_code", False))
+    use_fast_tokenizer = bool(model_kwargs.get("use_fast_tokenizer", True))
+    ignore_mismatched_sizes = bool(model_kwargs.get("ignore_mismatched_sizes", False))
+
+    # Resolve num_labels --------------------------------------------------------
+    num_labels = model_kwargs.get("num_labels", None)
+    if num_labels is None:
+        if task_name == "stsb":
+            num_labels = 1
+        elif task_name is not None and task_name in task_to_keys:
+            try:
+                ds = load_dataset("nyu-mll/glue", task_name, split="train")
+                num_labels = len(ds.features["label"].names)
+            except Exception:
+                num_labels = 2
+        else:
+            num_labels = 2
+
+    tokenizer = _get_tokenizer(
+        model_name_or_path,
+        use_fast=use_fast_tokenizer,
+        trust_remote_code=trust_remote_code,
+    )
+
+    hf_config = AutoConfig.from_pretrained(
+        model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=task_name,
+        trust_remote_code=trust_remote_code,
+    )
+    hf_config.pad_token_id = tokenizer.pad_token_id
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name_or_path,
+        from_tf=bool(".ckpt" in model_name_or_path),
+        config=hf_config,
+        ignore_mismatched_sizes=ignore_mismatched_sizes,
+        trust_remote_code=trust_remote_code,
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split (``"train"`` or ``"val"``).
+
+    A single base dataset is loaded, tokenised, then split via
+    ``torch.utils.data.random_split`` at ``train_val_ratio`` (default 0.8).
+
+    Config keys:
+        local.batch_size         (int)   [default 16]
+        data_path                (str)   directory searched for train.json / train.csv  [default "."]
+        task_name                (str)   GLUE task name; takes precedence over data_path
+        train_file               (str)   explicit path to a CSV/JSON training file
+        model_kwargs.*                   same keys as build_model
+        max_length               (int)   max tokenisation length  [default 128]
+        pad_to_max_length        (bool)  static vs dynamic padding  [default False]
+        train_val_ratio          (float) fraction used for "train"  [default 0.8]
+        seed                     (int)   RNG seed for random_split  [default 42]
+        allow_synthetic_data     (bool)  enable synthetic fallback  [default False]
+        synthetic_size           (int)   examples in synthetic dataset  [default 1000]
+
+    Raises:
+        FileNotFoundError: when real data cannot be loaded and allow_synthetic_data is False.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    task_name = config.get("task_name", None)
+    model_kwargs = config.get("model_kwargs", {})
+    model_name_or_path = model_kwargs.get("model_name_or_path", "bert-base-uncased")
+    trust_remote_code = bool(model_kwargs.get("trust_remote_code", False))
+    use_fast_tokenizer = bool(model_kwargs.get("use_fast_tokenizer", True))
+    max_length = int(config.get("max_length", 128))
+    pad_to_max_length = bool(config.get("pad_to_max_length", False))
+    train_val_ratio = float(config.get("train_val_ratio", 0.8))
+    seed = int(config.get("seed", 42))
+    is_regression = task_name == "stsb"
+
+    # ------------------------------------------------------------------
+    # Attempt to load and tokenise real data
+    # ------------------------------------------------------------------
+    processed_hf = None
+    load_error = None
+
+    try:
+        # --- source selection -------------------------------------------
+        if task_name is not None and task_name in task_to_keys:
+            raw_hf = load_dataset("nyu-mll/glue", task_name, split="train")
+        else:
+            train_file = config.get("train_file", None)
+            if train_file is None:
+                for ext in ("json", "csv"):
+                    candidate = os.path.join(data_path, f"train.{ext}")
+                    if os.path.exists(candidate):
+                        train_file = candidate
+                        break
+            if train_file is None or not os.path.exists(str(train_file)):
+                raise FileNotFoundError(
+                    f"No training data found. Provide config['task_name'], "
+                    f"config['train_file'], or place train.json / train.csv in "
+                    f"data_path='{data_path}'."
+                )
+            file_ext = train_file.rsplit(".", 1)[-1]
+            raw_datasets = load_dataset(file_ext, data_files={"train": train_file})
+            raw_hf = raw_datasets["train"]
+
+        # --- label mapping ----------------------------------------------
+        label_to_id = None
+        if not is_regression and "label" in raw_hf.features:
+            feat = raw_hf.features["label"]
+            if hasattr(feat, "names"):
+                label_to_id = {lbl: i for i, lbl in enumerate(feat.names)}
+            else:
+                label_list = sorted(raw_hf.unique("label"))
+                label_to_id = {v: i for i, v in enumerate(label_list)}
+
+        # --- sentence keys ----------------------------------------------
+        if task_name is not None and task_name in task_to_keys:
+            sentence1_key, sentence2_key = task_to_keys[task_name]
+        else:
+            non_label_cols = [c for c in raw_hf.column_names if c != "label"]
+            if "sentence1" in non_label_cols and "sentence2" in non_label_cols:
+                sentence1_key, sentence2_key = "sentence1", "sentence2"
+            elif len(non_label_cols) >= 2:
+                sentence1_key, sentence2_key = non_label_cols[0], non_label_cols[1]
+            else:
+                sentence1_key, sentence2_key = non_label_cols[0], None
+
+        # --- tokenisation -----------------------------------------------
+        tokenizer = _get_tokenizer(
+            model_name_or_path,
+            use_fast=use_fast_tokenizer,
+            trust_remote_code=trust_remote_code,
+        )
+        padding = "max_length" if pad_to_max_length else False
+
+        def preprocess_function(examples):
+            texts = (
+                (examples[sentence1_key],)
+                if sentence2_key is None
+                else (examples[sentence1_key], examples[sentence2_key])
+            )
+            result = tokenizer(
+                *texts, padding=padding, max_length=max_length, truncation=True
+            )
+            if "label" in examples:
+                if label_to_id is not None:
+                    result["labels"] = [label_to_id[lbl] for lbl in examples["label"]]
+                else:
+                    result["labels"] = examples["label"]
+            return result
+
+        processed_hf = raw_hf.map(
+            preprocess_function,
+            batched=True,
+            remove_columns=raw_hf.column_names,
+            desc=f"Tokenising ({task_name or 'custom'})",
+        )
+        processed_hf.set_format(type="torch")
+
+    except Exception as exc:
+        load_error = exc
+
+    # ------------------------------------------------------------------
+    # Synthetic fallback gate — MUST check allow_synthetic_data
+    # ------------------------------------------------------------------
+    if processed_hf is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Real dataset is unavailable "
+                f"(task_name={task_name!r}, data_path={data_path!r}) "
+                f"and the synthetic-data fallback is disabled. "
+                f"Cause: {load_error}. "
+                "Set config['allow_synthetic_data']=True to enable the synthetic fallback."
+            )
+        num_labels = int(model_kwargs.get("num_labels", 1 if is_regression else 2))
+        vocab_size = int(model_kwargs.get("vocab_size", 30522))
+        syn_size = int(config.get("synthetic_size", 1000))
+        full_dataset = _SyntheticGlueDataset(
+            size=syn_size,
+            seq_len=max_length,
+            vocab_size=vocab_size,
+            num_labels=num_labels,
+            is_regression=is_regression,
+        )
+        # Synthetic sequences are already fixed-length — no padding collator needed.
+        data_collator = default_data_collator
+    else:
+        full_dataset = _HFDatasetWrapper(processed_hf)
+        tokenizer = _get_tokenizer(
+            model_name_or_path,
+            use_fast=use_fast_tokenizer,
+            trust_remote_code=trust_remote_code,
+        )
+        data_collator = (
+            default_data_collator
+            if pad_to_max_length
+            else DataCollatorWithPadding(tokenizer)
+        )
+
+    # ------------------------------------------------------------------
+    # random_split → return requested subset
+    # ------------------------------------------------------------------
+    n_total = len(full_dataset)
+    n_train = max(1, int(n_total * train_val_ratio))
+    n_val = max(1, n_total - n_train)
+    # Guard: floating-point rounding may push sum off by one.
+    n_train = n_total - n_val
+
+    generator = torch.Generator().manual_seed(seed)
+    train_subset, val_subset = random_split(
+        full_dataset, [n_train, n_val], generator=generator
+    )
+    chosen = train_subset if split == "train" else val_subset
+
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        collate_fn=data_collator,
+    )
+
+
+def train_step(model, batch, optimizer, config: dict) -> torch.Tensor:
+    """Run one forward pass and return the loss tensor with grad attached.
+
+    ``AutoModelForSequenceClassification`` computes cross-entropy (or MSE for
+    regression) internally when ``labels`` are present in *batch*.
+
+    The FL runtime is solely responsible for calling ``loss.backward()``,
+    ``optimizer.step()``, and ``optimizer.zero_grad()``.
+    """
+    device = next(model.parameters()).device
+    batch = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
+    outputs = model(**batch)
+    return outputs.loss

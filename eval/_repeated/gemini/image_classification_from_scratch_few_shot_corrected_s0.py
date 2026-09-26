@@ -1,0 +1,184 @@
+"""
+Auto-generated FL client module.
+Original script: keras/image_classification_from_scratch.py
+
+Exposes:
+  build_model(config)               -> keras.Model
+  build_dataloader(config, split)   -> tf.data.Dataset
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import keras
+from keras import layers
+import tensorflow as tf
+from tensorflow import data as tf_data # Explicitly import tf_data
+
+# --- Model Definition (from original script) ---
+def make_model(input_shape, num_classes):
+    inputs = keras.Input(shape=input_shape)
+
+    # Entry block
+    x = layers.Rescaling(1.0 / 255)(inputs)
+    x = layers.Conv2D(128, 3, strides=2, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    previous_block_activation = x  # Set aside residual
+
+    for size in [256, 512, 728]:
+        x = layers.Activation("relu")(x)
+        x = layers.SeparableConv2D(size, 3, padding="same")(x)
+        x = layers.BatchNormalization()(x)
+
+        x = layers.Activation("relu")(x)
+        x = layers.SeparableConv2D(size, 3, padding="same")(x)
+        x = layers.BatchNormalization()(x)
+
+        x = layers.MaxPooling2D(3, strides=2, padding="same")(x)
+
+        # Project residual
+        residual = layers.Conv2D(size, 1, strides=2, padding="same")(
+            previous_block_activation
+        )
+        x = layers.add([x, residual])  # Add back residual
+        previous_block_activation = x  # Set aside next residual
+
+    x = layers.SeparableConv2D(1024, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    if num_classes == 2:
+        units = 1
+    else:
+        units = num_classes
+
+    x = layers.Dropout(0.25)(x)
+    # We specify activation=None so as to return logits
+    outputs = layers.Dense(units, activation=None)(x)
+    return keras.Model(inputs, outputs)
+
+
+# --- Data Augmentation Layers (from original script) ---
+_data_augmentation_layers = [
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.1),
+]
+
+def _apply_data_augmentation(images):
+    for layer in _data_augmentation_layers:
+        images = layer(images)
+    return images
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    model_kwargs = config.get("model_kwargs", {})
+    # Default parameters from original script for Cats vs Dogs
+    input_shape = model_kwargs.get("input_shape", (180, 180, 3))
+    num_classes = model_kwargs.get("num_classes", 2) # Binary classification
+    return make_model(input_shape=input_shape, num_classes=num_classes)
+
+
+def build_dataloader(config: dict, split: str = "train") -> tf_data.Dataset:
+    local_config = config.get("local", {})
+    # Default parameters from original script
+    data_path = config.get("data_path", "PetImages")
+    image_size = config.get("image_size", (180, 180))
+    batch_size = local_config.get("batch_size", config.get("batch_size", 128))
+    validation_split = config.get("validation_split", 0.2)
+    seed = config.get("seed", 1337)
+    num_parallel_calls = local_config.get("num_parallel_calls", tf_data.AUTOTUNE)
+
+    # Filtering corrupted images - from original script.
+    # This assumes 'data_path' contains 'Cat' and 'Dog' subdirectories.
+    print(f"[{split}] Checking for corrupted images in '{data_path}'...")
+    num_skipped = 0
+    for folder_name in ("Cat", "Dog"):
+        folder_path = os.path.join(data_path, folder_name)
+        if not os.path.exists(folder_path):
+            print(f"Warning: Folder '{folder_path}' not found. Skipping corruption check for it.")
+            continue
+        for fname in os.listdir(folder_path):
+            fpath = os.path.join(folder_path, fname)
+            try:
+                # Open with 'rb' for binary read
+                with open(fpath, "rb") as fobj:
+                    is_jfif = b"JFIF" in fobj.peek(10)
+            except Exception as e:
+                print(f"Error checking file {fpath}: {e}. Skipping deletion.")
+                is_jfif = True # Treat as not corrupted to avoid deleting on error
+            
+            if not is_jfif:
+                num_skipped += 1
+                try:
+                    os.remove(fpath)
+                except OSError as e:
+                    print(f"Error deleting corrupted image {fpath}: {e}")
+
+    print(f"[{split}] Deleted {num_skipped} corrupted images.")
+
+    # Create datasets using keras.utils.image_dataset_from_directory
+    train_ds_raw, val_ds_raw = keras.utils.image_dataset_from_directory(
+        data_path,
+        validation_split=validation_split,
+        subset="both",
+        seed=seed,
+        image_size=image_size,
+        batch_size=batch_size,
+        label_mode="binary" # Cats vs Dogs is binary classification
+    )
+
+    ds = train_ds_raw if split == "train" else val_ds_raw
+
+    # Apply data augmentation only to the training dataset
+    if split == "train":
+        ds = ds.map(
+            lambda img, label: (_apply_data_augmentation(img), label),
+            num_parallel_calls=num_parallel_calls,
+        )
+
+    # Prefetch for performance
+    ds = ds.prefetch(tf_data.AUTOTUNE)
+    return ds
+
+
+def train_step(
+    model: keras.Model,
+    batch: tuple | list,
+    optimizer, # Keras optimizer is typically part of model.compile, not used directly here
+    config: dict,
+) -> tf.Tensor:
+    """
+    ONE forward pass. Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    inputs, targets = batch
+
+    # Ensure targets are float32 and have the correct shape for BinaryCrossentropy
+    # if model output has shape (batch_size, 1).
+    if targets.dtype != tf.float32:
+        targets = tf.cast(targets, tf.float32)
+    if model.output_shape[1] == 1 and targets.shape[-1] != 1:
+        targets = tf.expand_dims(targets, -1)
+
+    # Forward pass: `training=True` ensures dropout and batch norm behave correctly
+    outputs = model(inputs, training=True)
+
+    # Instantiate loss function; default to BinaryCrossentropy from original script
+    loss_fn = config.get(
+        "loss_fn", keras.losses.BinaryCrossentropy(from_logits=True)
+    )
+
+    loss = loss_fn(targets, outputs)
+    return loss

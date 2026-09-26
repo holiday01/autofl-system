@@ -1,0 +1,164 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: pytorch/examples/imagenet/main.py (similar to)
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torchvision.transforms as transforms
+
+
+# Helper for model names, similar to original script
+model_names = sorted(name for name in models.__dict__
+    if name.islower() and not name.startswith("__")
+    and callable(models.__dict__[name]))
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Builds and returns the model based on the provided configuration.
+    """
+    kwargs = config.get("model_kwargs", {})
+    arch = kwargs.get("arch", "resnet18")
+    pretrained = kwargs.get("pretrained", False)
+
+    if arch not in model_names:
+        raise ValueError(f"Unknown model architecture: {arch}. Available: {model_names}")
+
+    print(f"=> {'using pre-trained' if pretrained else 'creating'} model '{arch}'")
+    model = models.__dict__[arch](pretrained=pretrained)
+    
+    # The FL runtime will handle device placement and parallelism (e.g., DataParallel, DDP).
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Builds and returns a DataLoader for the specified split (train or val).
+    """
+    local_config = config.get("local", {}) # Allows local overrides
+    
+    batch_size  = local_config.get("batch_size", config.get("batch_size", 256))
+    num_workers = local_config.get("num_workers", config.get("num_workers", 4))
+    pin_memory  = local_config.get("pin_memory", True)
+    data_path   = config.get("data_path", "imagenet") # Default from original script
+    dummy_data  = config.get("dummy", False)
+    
+    # ImageNet normalization from the original script
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+
+    if split == "train":
+        transform = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ])
+        if dummy_data:
+            print("=> Using dummy training data!")
+            # Use a representative size for FakeData
+            dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transform)
+        else:
+            traindir = os.path.join(data_path, 'train')
+            if not os.path.isdir(traindir):
+                raise FileNotFoundError(f"Training data directory not found: {traindir}")
+            dataset = datasets.ImageFolder(traindir, transform)
+        shuffle = True
+    elif split == "val":
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ])
+        if dummy_data:
+            print("=> Using dummy validation data!")
+            # Use a representative size for FakeData
+            dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transform)
+        else:
+            valdir = os.path.join(data_path, 'val')
+            if not os.path.isdir(valdir):
+                raise FileNotFoundError(f"Validation data directory not found: {valdir}")
+            dataset = datasets.ImageFolder(valdir, transform)
+        shuffle = False
+    else:
+        raise ValueError(f"Unknown split: {split}. Expected 'train' or 'val'.")
+
+    # Samplers (e.g., DistributedSampler) are typically managed by the FL framework.
+    # The client module provides a standard DataLoader; the FL system can wrap it
+    # or instantiate its own sampler if needed.
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        # Only pin memory if CUDA is available, as it's a CUDA-specific optimization
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer, # This parameter is part of the contract but not used internally by train_step
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass. Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    # Ensure model is in training mode.
+    # The FL runtime often handles this, but explicit setting is robust.
+    model.train()
+
+    # Determine the device the model is currently on
+    device = next(model.parameters()).device
+
+    # Move data to the model's device
+    if isinstance(batch, (list, tuple)):
+        images, targets = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
+    elif isinstance(batch, dict):
+        # Handle common dict keys for image datasets
+        images = batch.get("input", batch.get("x", batch.get("image"))).to(device, non_blocking=True)
+        targets = batch.get("label", batch.get("y", batch.get("target"))).to(device, non_blocking=True)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    # Compute model output
+    outputs = model(images)
+
+    # Define loss function. Instantiate here for statelessness or use config
+    # The original script used nn.CrossEntropyLoss
+    criterion = nn.CrossEntropyLoss()
+    # For nn.CrossEntropyLoss, moving it to device isn't strictly necessary as it has no parameters,
+    # but for other complex losses with parameters, this would be important.
+
+    # Compute loss
+    loss = criterion(outputs, targets)
+    
+    # Adhering to contract: Do NOT call optimizer.zero_grad(), loss.backward(),
+    # optimizer.step(), or loss.item() here.
+    return loss
+```

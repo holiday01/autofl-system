@@ -1,0 +1,190 @@
+import logging
+import os
+import sys
+import tempfile
+from glob import glob
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, random_split
+from torch.utils.tensorboard import SummaryWriter
+
+import monai
+from monai.data import create_test_image_3d, list_data_collate, decollate_batch
+from monai.inferers import sliding_window_inference
+from monai.metrics import DiceMetric
+from monai.transforms import (
+    Activations,
+    EnsureChannelFirstd,
+    AsDiscrete,
+    Compose,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+from monai.visualize import plot_2d_or_3d_image
+from monai.networks.nets import UNet
+from monai.losses import DiceLoss
+
+# It's good practice to set up basic logging for FL clients
+logging.basicConfig(level=logging.INFO)
+
+
+class FLClientDataset(monai.data.Dataset):
+    """
+    A MONAI Dataset wrapper that applies transforms and handles file loading.
+    """
+
+    def __init__(self, data, transform=None):
+        super().__init__(data, transform)
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    """
+    Instantiate and return the MONAI UNet model.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = UNet(
+        spatial_dims=model_kwargs.get("spatial_dims", 3),
+        in_channels=model_kwargs.get("in_channels", 1),
+        out_channels=model_kwargs.get("out_channels", 1),
+        channels=model_kwargs.get("channels", (16, 32, 64, 128, 256)),
+        strides=model_kwargs.get("strides", (2, 2, 2, 2)),
+        num_res_units=model_kwargs.get("num_res_units", 2),
+    ).to(device)
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+    Uses synthetic data if `allow_synthetic_data` is True and real data is not found.
+    """
+    data_path = config.get("data_path", ".")
+    allow_synthetic_data = config.get("allow_synthetic_data", False)
+    local_config = config.get("local", {})
+    batch_size = local_config.get("batch_size", 16)
+    num_workers = local_config.get("num_workers", 4)
+    # The original script uses a batch_size of 2 for training and 1 for validation,
+    # and then RandCropByPosNegLabeld creates 4 samples per image.
+    # We will stick to the config's batch_size here but note this difference.
+
+    # Define transforms (copied from the original script)
+    train_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+            RandCropByPosNegLabeld(
+                keys=["img", "seg"], label_key="seg", spatial_size=[96, 96, 96], pos=1, neg=1, num_samples=4
+            ),
+            RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+        ]
+    )
+    val_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+        ]
+    )
+
+    data_files = []
+    # Try to load real data
+    try:
+        if not os.path.exists(data_path) or not glob(os.path.join(data_path, "img*.nii.gz")):
+            raise FileNotFoundError(f"No NIfTI files found in {data_path}. Attempting synthetic data fallback.")
+
+        images = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+        segs = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+
+        if not images or not segs or len(images) != len(segs):
+            raise FileNotFoundError(f"Incomplete data pairs found in {data_path}. Attempting synthetic data fallback.")
+
+        data_files = [{"img": img, "seg": seg} for img, seg in zip(images, segs)]
+        logging.info(f"Loaded {len(data_files)} real data samples from {data_path}.")
+
+    except FileNotFoundError as e:
+        logging.warning(f"Data loading warning: {e}")
+        if allow_synthetic_data:
+            logging.info("Generating synthetic data as 'allow_synthetic_data' is True.")
+            tempdir = tempfile.mkdtemp()
+            # Generate 40 image, mask pairs (as in the original script)
+            for i in range(40):
+                im, seg = create_test_image_3d(128, 128, 128, num_seg_classes=1, channel_dim=-1)
+                n = nib.Nifti1Image(im, np.eye(4))
+                nib.save(n, os.path.join(tempdir, f"img{i:d}.nii.gz"))
+                n = nib.Nifti1Image(seg, np.eye(4))
+                nib.save(n, os.path.join(tempdir, f"seg{i:d}.nii.gz"))
+
+            images = sorted(glob(os.path.join(tempdir, "img*.nii.gz")))
+            segs = sorted(glob(os.path.join(tempdir, "seg*.nii.gz")))
+            data_files = [{"img": img, "seg": seg} for img, seg in zip(images, segs)]
+            logging.info(f"Generated {len(data_files)} synthetic data samples in {tempdir}.")
+        else:
+            raise FileNotFoundError(
+                f"No data found at '{data_path}' and 'allow_synthetic_data' is False. "
+                "Please provide data or enable synthetic data generation."
+            ) from e
+
+    if not data_files:
+        raise RuntimeError("No data files available after attempting real and synthetic data loading.")
+
+    # Split the dataset into train and validation
+    train_size = int(0.8 * len(data_files))  # 80% for training
+    val_size = len(data_files) - train_size  # Remaining for validation
+
+    # Ensure consistent splitting
+    # The original script uses fixed splits (first 20 for train, last 20 for val from 40 samples).
+    # For FL, it's generally better to use random_split on the available local data for train/val splits.
+    # We will use random_split here. If a fixed split is strictly needed, it should be managed externally
+    # or by passing specific indices in the config.
+    g = torch.Generator().manual_seed(42) # for reproducibility of random_split
+    full_dataset = FLClientDataset(data=data_files) # Temporary dataset to get lengths for random_split
+    train_data_indices, val_data_indices = random_split(
+        range(len(full_dataset)), [train_size, val_size], generator=g
+    )
+
+    if split == "train":
+        current_data = [data_files[i] for i in train_data_indices.indices]
+        current_transform = train_transforms
+        shuffle = True
+    elif split == "val":
+        current_data = [data_files[i] for i in val_data_indices.indices]
+        current_transform = val_transforms
+        shuffle = False
+        # The original script uses batch_size=1 for validation. Let's respect that.
+        batch_size = 1 # Overrides the general batch_size for validation
+
+    else:
+        raise ValueError(f"Invalid split: {split}. Expected 'train' or 'val'.")
+
+    dataset = FLClientDataset(data=current_data, transform=current_transform)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=list_data_collate,
+        pin_memory=torch.cuda.is_available(),
+    )
+    logging.info(f"Created {split} DataLoader with {len(current_data)} samples and batch size {batch_size}.")
+    return dataloader
+
+
+def train_step(model, batch, optimizer, config: dict) -> torch.Tensor:
+    """
+    Run ONE forward pass only. Return the loss tensor WITH grad attached.
+    Do NOT call loss.backward() or optimizer.step() — the FL runtime handles that.
+    """
+    device = next(model.parameters()).device  # Get the device of the model
+    loss_function = DiceLoss(sigmoid=True) # Loss function as in original script
+
+    inputs, labels = batch["img"].to(device), batch["seg"].to(device)
+    outputs = model(inputs)
+    loss = loss_function(outputs, labels)
+    return loss

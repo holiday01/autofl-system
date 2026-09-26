@@ -1,0 +1,157 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: timeseries classification from scratch (FordA, Keras FCN).
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+
+
+class FordADataset(Dataset):
+    """
+    FordA timeseries dataset loaded from UCR/UEA-format TSV files.
+    First column is the class label (-1 or 1, remapped to 0/1); remaining
+    columns are the 500-point univariate timeseries.
+    Falls back to synthetic data when the TSV files are absent.
+    """
+
+    def __init__(self, root: str, file_split: str = "train", seq_len: int = 500,
+                 num_classes: int = 2):
+        filename = "FordA_TRAIN.tsv" if file_split == "train" else "FordA_TEST.tsv"
+        path = os.path.join(root, filename)
+
+        if os.path.isfile(path):
+            data = np.loadtxt(path, delimiter="\t")
+            y = data[:, 0].astype(int)
+            x = data[:, 1:].astype(np.float32)
+        else:
+            n = 200 if file_split == "train" else 50
+            x = np.random.randn(n, seq_len).astype(np.float32)
+            y = np.random.choice([-1, 1], size=n)
+
+        y = np.where(y == -1, 0, y).astype(np.int64)
+        self.x = x
+        self.y = y
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        # Conv1d expects (batch, channels, seq_len); add channel dim here
+        x = torch.tensor(self.x[idx], dtype=torch.float32).unsqueeze(0)
+        y = torch.tensor(self.y[idx], dtype=torch.long)
+        return x, y
+
+
+class FCNClassifier(nn.Module):
+    """
+    Fully Convolutional Network for timeseries classification.
+    PyTorch port of the Keras FCN from Fawaz et al. (arXiv:1611.06455).
+    Input: (batch, 1, seq_len)  Output: (batch, num_classes)
+    """
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 2,
+                 filters: int = 64, kernel_size: int = 3):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv1d(in_channels, filters, kernel_size, padding="same"),
+            nn.BatchNorm1d(filters),
+            nn.ReLU(),
+            nn.Conv1d(filters, filters, kernel_size, padding="same"),
+            nn.BatchNorm1d(filters),
+            nn.ReLU(),
+            nn.Conv1d(filters, filters, kernel_size, padding="same"),
+            nn.BatchNorm1d(filters),
+            nn.ReLU(),
+        )
+        self.classifier = nn.Linear(filters, num_classes)
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = x.mean(dim=-1)  # global average pooling over time axis
+        return self.classifier(x)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return FCNClassifier(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 32))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", ".")
+    dataset_kwargs = config.get("dataset_kwargs", {})
+
+    if split == "test":
+        ds = FordADataset(root=data_path, file_split="test", **dataset_kwargs)
+    else:
+        full_train = FordADataset(root=data_path, file_split="train", **dataset_kwargs)
+        val_ratio = config.get("val_ratio", 0.2)
+        n_val = max(1, int(len(full_train) * val_ratio))
+        n_train = len(full_train) - n_val
+        train_ds, val_ds = random_split(
+            full_train, [n_train, n_val],
+            generator=torch.Generator().manual_seed(config.get("seed", 42)),
+        )
+        ds = train_ds if split == "train" else val_ds
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("timeseries")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(outputs, targets)
+    return loss
+```

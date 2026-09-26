@@ -1,0 +1,18 @@
+/home/holiday01/autofl/eval/_expansion/holdout/none/xgb_sklearn_examples_template_s0.py:215: UserWarning: Using a target size (torch.Size([4, 1])) that is different to the input size (torch.Size([4, 10])). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size.
+  loss = F.mse_loss(logits.reshape(logits.size(0), -1), y.float().reshape(y.size(0), -1))
+/home/holiday01/autofl/eval/_expansion/holdout/none/xgb_sklearn_examples_template_s0.py:215: UserWarning: Using a target size (torch.Size([4, 1])) that is different to the input size (torch.Size([4, 10])). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size.
+  loss = F.mse_loss(logits.reshape(logits.size(0), -1), y.float().reshape(y.size(0), -1))
+/home/holiday01/autofl/eval/_expansion/holdout/none/xgb_sklearn_examples_template_s0.py:215: UserWarning: Using a target size (torch.Size([4, 1])) that is different to the input size (torch.Size([4, 10])). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size.
+  loss = F.mse_loss(logits.reshape(logits.size(0), -1), y.float().reshape(y.size(0), -1))
+  Preflight [eval-client]: PASS  (4.2s)
+  Preflight [eval-site-1]: PASS
+
+Starting FL: 1 rounds, 1 clients
+==================================================
+
+Round 1/1
+    [eval-site-1] loss=0.1240  steps=81  n=324  0.03s
+  Aggregated loss: 0.1240  (0.04s)
+
+FL training complete.
+EVALJSON {"syntax_valid": true, "interface_complete": true, "build_model_present": true, "build_dataloader_present": true, "train_step_present": true, "optimizer_detected": true, "preflight_pass": true, "e2e_runnable": true, "error_stage": "", "error_message": "", "elapsed_sec": 4.23, "data_path": ".", "data_path_exists": true, "strict_data": false, "spec_version": "n/a", "dataset_class": "TensorDataset", "dataset_len": 360, "component_coverage": 1.0}

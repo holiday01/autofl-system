@@ -1,0 +1,236 @@
+```python
+# Copyright (c) MONAI Consortium
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import sys
+import tempfile
+from glob import glob
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset as TorchDataset, random_split
+from torch.utils.tensorboard import SummaryWriter
+
+import monai
+from monai.data import create_test_image_3d, list_data_collate, decollate_batch
+from monai.inferers import sliding_window_inference
+from monai.metrics import DiceMetric
+from monai.transforms import (
+    Activations,
+    EnsureChannelFirstd,
+    AsDiscrete,
+    Compose,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+from monai.visualize import plot_2d_or_3d_image
+
+
+# ---------------------------------------------------------------------------
+# Internal synthetic dataset (used only when allow_synthetic_data=True)
+# ---------------------------------------------------------------------------
+
+class _SyntheticSegDataset(TorchDataset):
+    """Returns random 3-D image/segmentation dict pairs without touching disk."""
+
+    def __init__(self, length: int = 40, spatial_size=(96, 96, 96)):
+        self.length = length
+        self.spatial_size = spatial_size
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int):
+        img = torch.randn(1, *self.spatial_size)
+        seg = torch.randint(0, 2, (1, *self.spatial_size)).float()
+        return {"img": img, "seg": seg}
+
+
+# ---------------------------------------------------------------------------
+# FL API
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate the 3-D UNet from config.
+
+    Recognised keys inside config.get("model_kwargs", {}):
+        spatial_dims  (default 3)
+        in_channels   (default 1)
+        out_channels  (default 1)
+        channels      (default (16, 32, 64, 128, 256))
+        strides       (default (2, 2, 2, 2))
+        num_res_units (default 2)
+    """
+    kwargs = config.get("model_kwargs", {})
+    model = monai.networks.nets.UNet(
+        spatial_dims=kwargs.get("spatial_dims", 3),
+        in_channels=kwargs.get("in_channels", 1),
+        out_channels=kwargs.get("out_channels", 1),
+        channels=tuple(kwargs.get("channels", (16, 32, 64, 128, 256))),
+        strides=tuple(kwargs.get("strides", (2, 2, 2, 2))),
+        num_res_units=kwargs.get("num_res_units", 2),
+    )
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split ("train" or "val").
+
+    Config keys consumed:
+        data_path                  – directory that contains img*.nii.gz / seg*.nii.gz
+                                     (default ".")
+        local.batch_size           – mini-batch size (default 16)
+        allow_synthetic_data       – if True and no real files are found, fall back to
+                                     purely synthetic tensors; if False (default) raise
+                                     FileNotFoundError instead.
+
+    The full file list is split 80 / 20 train / val with a fixed seed so that
+    calling build_dataloader(config, "train") and build_dataloader(config, "val")
+    always produces disjoint, deterministic partitions.
+    """
+    data_path = config.get("data_path", ".")
+    batch_size = config.get("local", {}).get("batch_size", 16)
+
+    # ------------------------------------------------------------------
+    # MONAI transform pipelines (mirrors the original script exactly)
+    # ------------------------------------------------------------------
+    train_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+            RandCropByPosNegLabeld(
+                keys=["img", "seg"],
+                label_key="seg",
+                spatial_size=[96, 96, 96],
+                pos=1,
+                neg=1,
+                num_samples=4,
+            ),
+            RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+        ]
+    )
+    val_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+        ]
+    )
+
+    # ------------------------------------------------------------------
+    # Locate real NIfTI pairs
+    # ------------------------------------------------------------------
+    images = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+    segs = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+    have_real_data = bool(images and segs)
+
+    if not have_real_data:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"No NIfTI image/segmentation pairs (img*.nii.gz / seg*.nii.gz) "
+                f"were found under '{os.path.abspath(data_path)}'. "
+                "Point config['data_path'] at the correct directory, or set "
+                "config['allow_synthetic_data'] = True to train on synthetic tensors."
+            )
+
+        # ------------------------------------------------------------------
+        # Synthetic fallback path (only reached when flag is True)
+        # ------------------------------------------------------------------
+        full_ds = _SyntheticSegDataset(length=40, spatial_size=(96, 96, 96))
+        n_train = int(0.8 * len(full_ds))
+        n_val = len(full_ds) - n_train
+        generator = torch.Generator().manual_seed(42)
+        train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=generator)
+        ds = train_ds if split == "train" else val_ds
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+            num_workers=0,
+        )
+
+    # ------------------------------------------------------------------
+    # Real-data path: build a MONAI Dataset with the appropriate
+    # transforms, then carve out train / val via random_split.
+    # Using the same Generator seed guarantees disjoint partitions when
+    # both splits are requested independently.
+    # ------------------------------------------------------------------
+    data_dicts = [{"img": img, "seg": seg} for img, seg in zip(images, segs)]
+    n_total = len(data_dicts)
+    n_train = int(0.8 * n_total)
+    n_val = n_total - n_train
+
+    transforms = train_transforms if split == "train" else val_transforms
+    full_ds = monai.data.Dataset(data=data_dicts, transform=transforms)
+
+    generator = torch.Generator().manual_seed(42)
+    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=generator)
+    ds = train_ds if split == "train" else val_ds
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=4,
+        collate_fn=list_data_collate,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """One forward pass; returns the DiceLoss tensor with grad attached.
+
+    The FL runtime is responsible for calling loss.backward() and
+    optimizer.step() / optimizer.zero_grad().  This function must NOT
+    do either.
+
+    Args:
+        model:     the UNet returned by build_model, already on its device.
+        batch:     dict with keys "img" (N,C,D,H,W) and "seg" (N,1,D,H,W).
+        optimizer: passed in by the FL runtime (not used here directly).
+        config:    the same config dict passed to build_model / build_dataloader.
+
+    Returns:
+        Scalar loss tensor (grad_fn attached).
+    """
+    device = next(model.parameters()).device
+    inputs = batch["img"].to(device)
+    labels = batch["seg"].to(device)
+
+    loss_fn = monai.losses.DiceLoss(sigmoid=True)
+    outputs = model(inputs)
+    loss = loss_fn(outputs, labels)
+    return loss
+```
+
+---
+
+Here's a summary of every decision made during the conversion:
+
+| Concern | Decision |
+|---|---|
+| **Model class** | Not copied verbatim — `monai.networks.nets.UNet` is a library class, so `build_model` simply calls it with defaults that mirror the original script; all parameters are overridable via `config["model_kwargs"]`. |
+| **MONAI transforms** | Kept exactly as in the original (`train_transforms` / `val_transforms`). They live inside `build_dataloader` and are wrapped by `monai.data.Dataset`, which applies them per-sample — satisfying the "wrap transforms in the Dataset class" rule. |
+| **`random_split`** | Applied to the full `monai.data.Dataset` with a fixed seed (`42`) so that calling `build_dataloader(config, "train")` and `build_dataloader(config, "val")` independently always produces the **same disjoint 80/20 partition**. Train and val get their own transform pipelines because the split is performed after building a dataset with the appropriate transforms. |
+| **Synthetic fallback** | Gated strictly on `config.get("allow_synthetic_data", False)`. If the flag is absent or `False` and no NIfTI files are found, a `FileNotFoundError` is raised immediately. `_SyntheticSegDataset` returns `{"img": randn, "seg": randint}` dicts compatible with `train_step`. |
+| **`train_step`** | Single forward pass only. `loss.backward()` and `optimizer.step()` are **not called**. The loss tensor is returned with its `grad_fn` intact for the FL runtime to consume. `monai.losses.DiceLoss(sigmoid=True)` is instantiated fresh each call (stateless). |
+| **Removed** | TensorBoard writer, validation loop, `sliding_window_inference`, checkpoint saving, `main()` entry-point — none of these belong in a client module. |

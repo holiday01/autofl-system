@@ -1,0 +1,186 @@
+from os import path
+from typing import Optional
+
+import torch
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, random_split, Dataset
+
+from torchvision import transforms
+from torchvision.datasets import MNIST
+
+
+# The original Backbone model class
+class Backbone(torch.nn.Module):
+    """
+    >>> Backbone()  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    Backbone(
+      (l1): Linear(...)
+      (l2): Linear(...)
+    )
+    """
+
+    def __init__(self, hidden_dim=128):
+        super().__init__()
+        self.l1 = torch.nn.Linear(28 * 28, hidden_dim)
+        self.l2 = torch.nn.Linear(hidden_dim, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.l1(x))
+        return torch.relu(self.l2(x))
+
+
+# The original LitClassifier, adapted to be a standard torch.nn.Module.
+# Lightning-specific features like `save_hyperparameters`, `training_step`, `validation_step`,
+# `test_step`, `predict_step`, and `configure_optimizers` are removed as they are not
+# directly used by the FL client interface. The core model structure (`__init__` and `forward`)
+# is retained.
+class LitClassifier(torch.nn.Module):
+    """
+    >>> LitClassifier(Backbone())  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    LitClassifier(
+      (backbone): ...
+    )
+    """
+
+    def __init__(self, backbone: Optional[Backbone] = None, learning_rate: float = 0.0001):
+        super().__init__()
+        if backbone is None:
+            backbone = Backbone()
+        self.backbone = backbone
+        # learning_rate is typically an optimizer parameter, but kept here for completeness
+        # if the original LightningModule stored it, though it won't be used directly by the model.
+        self.learning_rate = learning_rate
+
+    def forward(self, x):
+        # use forward for inference/predictions
+        return self.backbone(x)
+
+
+# Synthetic data fallback dataset as required by the rules.
+class SyntheticMNISTDataset(Dataset):
+    def __init__(self, num_samples=1000, img_shape=(1, 28, 28), num_classes=10):
+        self.num_samples = num_samples
+        self.img_shape = img_shape
+        self.num_classes = num_classes
+
+        # Generate random images (float) and labels (long)
+        self.images = torch.randn(num_samples, *img_shape)
+        self.labels = torch.randint(0, num_classes, (num_samples,), dtype=torch.long)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        return self.images[idx], self.labels[idx]
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    """
+    Instantiate and return the model.
+    - Uses config.get("model_kwargs", {}) for constructor args.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    
+    # Extract backbone-specific arguments if present
+    backbone_kwargs = model_kwargs.pop("backbone_kwargs", {})
+    backbone = Backbone(**backbone_kwargs)
+    
+    # Pass the instantiated backbone and any remaining model_kwargs to LitClassifier
+    model = LitClassifier(backbone=backbone, **model_kwargs)
+    return model
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+    - Read batch_size from config.get("local", {}).get("batch_size", 16).
+    - Read data_path from config.get("data_path", ".").
+    - Use random_split to produce train/val subsets from a single dataset.
+    - Include a synthetic data fallback.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    allow_synthetic_data = config.get("allow_synthetic_data", False)
+
+    transform = transforms.ToTensor()
+
+    dataset: Dataset
+
+    if allow_synthetic_data:
+        dataset = SyntheticMNISTDataset(num_samples=1000) # Arbitrary number of synthetic samples
+    else:
+        # Attempt to load the real dataset
+        try:
+            # The original script splits the 'train' part of MNIST into actual train and validation sets.
+            # The 'test' part is unused in this FL client module for training/validation.
+            full_mnist_train_val_dataset = MNIST(
+                root=data_path, train=True, download=True, transform=transform
+            )
+
+            # The original script uses a fixed seed for reproducibility of random_split
+            generator = torch.Generator().manual_seed(42)
+            train_size = 55000
+            val_size = 5000
+
+            # Check if the full dataset is large enough for the requested split sizes
+            if len(full_mnist_train_val_dataset) < (train_size + val_size):
+                raise ValueError(
+                    f"MNIST dataset size ({len(full_mnist_train_val_dataset)}) is too small for "
+                    f"requested train ({train_size}) and validation ({val_size}) split sizes. "
+                    "Adjust split sizes or enable synthetic data."
+                )
+
+            # Perform the random split
+            mnist_train, mnist_val = random_split(
+                full_mnist_train_val_dataset, [train_size, val_size], generator=generator
+            )
+
+            if split == "train":
+                dataset = mnist_train
+            elif split == "val":
+                dataset = mnist_val
+            else:
+                raise ValueError(f"Invalid split: {split}. Expected 'train' or 'val'.")
+
+        except Exception as e:
+            # If any error occurs during real data loading/processing, and synthetic data is not allowed,
+            # raise a FileNotFoundError as per rules.
+            if isinstance(e, FileNotFoundError):
+                raise FileNotFoundError(
+                    f"MNIST dataset not found or accessible at '{data_path}' and "
+                    f"'allow_synthetic_data' is False. Original error: {e}"
+                )
+            else:
+                # Catch other potential errors like download failures, extraction issues,
+                # or dataset integrity problems.
+                raise FileNotFoundError(
+                    f"Failed to load or process MNIST dataset from '{data_path}' and "
+                    f"'allow_synthetic_data' is False. Error: {e}"
+                )
+
+    # Shuffle only for the training split
+    shuffle = (split == "train")
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+def train_step(model, batch, optimizer, config: dict) -> torch.Tensor:
+    """
+    Run ONE forward pass only. Return the loss tensor WITH grad attached.
+    - Do NOT call loss.backward() or optimizer.step() — the FL runtime handles that.
+    - Move tensors to the device of the model parameters.
+    """
+    # Determine the device of the model parameters
+    # This assumes the model has parameters and they are all on the same device.
+    device = next(model.parameters()).device
+
+    x, y = batch
+    x, y = x.to(device), y.to(device)
+
+    # Perform the forward pass through the model
+    y_hat = model(x) # LitClassifier's forward method is called
+
+    # Calculate the loss using Cross Entropy as in the original LightningModule's training_step
+    loss = F.cross_entropy(y_hat, y)
+
+    return loss

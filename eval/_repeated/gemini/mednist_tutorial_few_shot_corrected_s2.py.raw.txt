@@ -1,0 +1,241 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: monai_ixi_gender_classification.py
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+
+import monai
+from monai.transforms import EnsureChannelFirst, Compose, RandRotate90, Resize, ScaleIntensity, LoadImage, ToTensor, AddChannel
+import monai.networks.nets
+
+
+class IXIGenderDataset(Dataset):
+    """
+    Custom Dataset for the IXI Gender classification task.
+    Loads a predefined list of NIfTI files into memory (as numpy arrays) or generates synthetic data.
+    The `transform` (a MONAI Compose object) is applied in `__getitem__`.
+    """
+    def __init__(self, root: str, transform=None, synthetic_n=20, image_size=(96, 96, 96), num_classes=2):
+        self.root = root
+        self.transform = transform
+        self.image_size = image_size
+        self.num_classes = num_classes
+
+        self.features = [] # Stores np.ndarray (C, H, W, D)
+        self.labels = [] # Stores int labels
+
+        self._load_data(synthetic_n)
+
+    def _load_data(self, synthetic_n):
+        original_images_relative = [
+            "IXI314-IOP-0889-T1.nii.gz", "IXI249-Guys-1072-T1.nii.gz", "IXI609-HH-2600-T1.nii.gz",
+            "IXI173-HH-1590-T1.nii.gz", "IXI020-Guys-0700-T1.nii.gz", "IXI342-Guys-0909-T1.nii.gz",
+            "IXI134-Guys-0780-T1.nii.gz", "IXI577-HH-2661-T1.nii.gz", "IXI066-Guys-0731-T1.nii.gz",
+            "IXI130-HH-1528-T1.nii.gz", "IXI607-Guys-1097-T1.nii.gz", "IXI175-HH-1570-T1.nii.gz",
+            "IXI385-HH-2078-T1.nii.gz", "IXI344-Guys-0905-T1.nii.gz", "IXI409-Guys-0960-T1.nii.gz",
+            "IXI584-Guys-1129-T1.nii.gz", "IXI253-HH-1694-T1.nii.gz", "IXI092-HH-1436-T1.nii.gz",
+            "IXI574-IOP-1156-T1.nii.gz", "IXI585-Guys-1130-T1.nii.gz",
+        ]
+        original_labels_arr = np.array([0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0], dtype=np.int64)
+
+        # Determine the effective data_path for IXI-T1 based on common structures or original script's default
+        effective_data_path = None
+        # Option 1: 'IXI-T1' subfolder in root
+        if os.path.isdir(os.path.join(self.root, "IXI-T1")):
+            effective_data_path = os.path.join(self.root, "IXI-T1")
+        # Option 2: root itself is the 'IXI-T1' folder (contains NIfTI files)
+        elif os.path.isdir(self.root) and any(f.endswith(".nii.gz") for f in os.listdir(self.root)):
+            effective_data_path = self.root
+        # Option 3: Mimic original script's default path for check if root is '.'
+        elif self.root == "." and os.path.isdir(os.path.join(".", "workspace", "data", "medical", "ixi", "IXI-T1")):
+            effective_data_path = os.path.join(".", "workspace", "data", "medical", "ixi", "IXI-T1")
+
+        found_all_files = False
+        real_image_paths = []
+        if effective_data_path:
+            for f_name in original_images_relative:
+                full_path = os.path.join(effective_data_path, f_name)
+                if os.path.exists(full_path):
+                    real_image_paths.append(full_path)
+                else:
+                    # If any expected file is missing, consider the real dataset incomplete
+                    break
+            if len(real_image_paths) == len(original_images_relative):
+                found_all_files = True
+
+        if found_all_files:
+            print(f"Loaded {len(real_image_paths)} real images from {effective_data_path}")
+            # Use MONAI's LoadImage to read NIfTI files
+            image_loader = LoadImage(image_only=True)
+            for i, path in enumerate(real_image_paths):
+                img = image_loader(path)
+                # Ensure the image has a channel dimension (C, H, W, D) for MONAI transforms
+                img_with_channel = AddChannel()(img)
+                self.features.append(img_with_channel.astype(np.float32))
+                self.labels.append(original_labels_arr[i])
+        else:
+            print(f"Real data not found/incomplete for expected IXI files in '{self.root}'. Generating {synthetic_n} synthetic samples.")
+            # Synthetic fallback: generate numpy arrays directly (C, H, W, D)
+            for _ in range(synthetic_n):
+                # Simulate a 3D image with 1 channel
+                self.features.append(np.random.randn(1, *self.image_size).astype(np.float32))
+                self.labels.append(np.random.randint(0, self.num_classes))
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        img = self.features[idx] # This is a numpy array (C, H, W, D)
+        label = self.labels[idx] # This is an int
+
+        # Apply transforms if provided. Transforms should include ToTensor as the last step.
+        if self.transform:
+            img = self.transform(img)
+        else:
+            # If no transform, ensure it's a tensor (MONAI transforms typically handle this)
+            img = torch.tensor(img, dtype=torch.float32)
+
+        return img, torch.tensor(label, dtype=torch.long)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """Builds the MONAI DenseNet121 model."""
+    kwargs = config.get("model_kwargs", {})
+    # Default parameters from the original script
+    default_kwargs = dict(spatial_dims=3, in_channels=1, out_channels=2)
+    default_kwargs.update(kwargs) # Allow config to override defaults
+    return monai.networks.nets.DenseNet121(**default_kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Builds and returns a MONAI DataLoader for either training or validation.
+    Handles data loading, transforms, and splitting.
+    """
+    local = config.get("local", {})
+    batch_size = local.get("batch_size", config.get("batch_size", 2))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory = local.get("pin_memory", True)
+    seed = config.get("seed", 42)
+    val_ratio = config.get("val_ratio", 0.5) # Original script uses 10 train, 10 val from 20 samples
+
+    # Data paths and parameters for IXIGenderDataset
+    data_path = config.get("data_path", ".")
+    dataset_kwargs = config.get("dataset_kwargs", {})
+    synthetic_n = dataset_kwargs.get("synthetic_n", 20) # Default to 20 samples if synthetic
+    image_size = dataset_kwargs.get("image_size", (96, 96, 96))
+    num_classes = dataset_kwargs.get("num_classes", 2)
+
+    # Define transforms based on the original script, adding ToTensor
+    # EnsureChannelFirst is included for robustness, though IXIGenderDataset tries to ensure it.
+    base_transforms = [
+        ScaleIntensity(),
+        EnsureChannelFirst(),
+        Resize(image_size),
+    ]
+
+    train_specific_transforms = [RandRotate90()]
+    val_specific_transforms = []
+
+    # All transforms chains must end with ToTensor to convert numpy arrays to torch.Tensors
+    train_transforms_list = base_transforms + train_specific_transforms + [ToTensor()]
+    val_transforms_list = base_transforms + val_specific_transforms + [ToTensor()]
+
+    # Create Compose objects
+    default_train_transforms = Compose(train_transforms_list)
+    default_val_transforms = Compose(val_transforms_list)
+
+    # Allow transforms to be overridden/configured via config
+    transform_to_apply = (
+        config.get("train_transforms", default_train_transforms)
+        if split == "train"
+        else config.get("val_transforms", default_val_transforms)
+    )
+
+    # Create the full dataset instance
+    full_dataset = IXIGenderDataset(
+        root=data_path,
+        transform=transform_to_apply, # Pass the composed transform to the dataset
+        synthetic_n=synthetic_n,
+        image_size=image_size,
+        num_classes=num_classes
+    )
+
+    # Split the dataset into train and validation parts
+    n_total = len(full_dataset)
+    n_val = max(1, int(n_total * val_ratio))
+    n_train = n_total - n_val
+
+    # Ensure consistent splitting for reproducibility using a generator
+    generator = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(full_dataset, [n_train, n_val], generator=generator)
+
+    ds = train_ds if split == "train" else val_ds
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"), # Shuffle only for training data
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,  # Optimizer is passed but not used internally per contract
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    # Determine the device of the model's parameters to move data to the same device
+    device = next(model.parameters()).device
+
+    # MONAI DataLoader typically returns a tuple (image_tensor, label_tensor)
+    if isinstance(batch, (list, tuple)):
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        # Fallback for other batch structures (e.g., if using DictDataset)
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    # Move inputs and targets to the model's device
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+
+    # Perform forward pass
+    outputs = model(inputs)
+
+    # Instantiate loss function (CrossEntropyLoss for classification)
+    # It's instantiated here for simplicity, or could be passed via config or a global.
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(outputs, targets)
+
+    return loss
+```

@@ -1,0 +1,330 @@
+import os
+import random
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.optim import Adam
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data.sampler import Sampler
+from torchvision.datasets import FashionMNIST
+
+
+# ============================================================
+#  loss.py (inlined)
+# ============================================================
+
+class TripletMarginLoss(nn.Module):
+    def __init__(self, margin=1.0, p=2.0, mining="batch_all"):
+        super().__init__()
+        self.margin = margin
+        self.p = p
+        self.mining = mining
+
+        if mining == "batch_all":
+            self.loss_fn = batch_all_triplet_loss
+        if mining == "batch_hard":
+            self.loss_fn = batch_hard_triplet_loss
+
+    def forward(self, embeddings, labels):
+        return self.loss_fn(labels, embeddings, self.margin, self.p)
+
+
+def batch_hard_triplet_loss(labels, embeddings, margin, p):
+    pairwise_dist = torch.cdist(embeddings, embeddings, p=p)
+
+    mask_anchor_positive = _get_anchor_positive_triplet_mask(labels).float()
+    anchor_positive_dist = mask_anchor_positive * pairwise_dist
+
+    hardest_positive_dist, _ = anchor_positive_dist.max(1, keepdim=True)
+
+    mask_anchor_negative = _get_anchor_negative_triplet_mask(labels).float()
+
+    max_anchor_negative_dist, _ = pairwise_dist.max(1, keepdim=True)
+    anchor_negative_dist = pairwise_dist + max_anchor_negative_dist * (1.0 - mask_anchor_negative)
+
+    hardest_negative_dist, _ = anchor_negative_dist.min(1, keepdim=True)
+
+    triplet_loss = hardest_positive_dist - hardest_negative_dist + margin
+    triplet_loss[triplet_loss < 0] = 0
+
+    triplet_loss = triplet_loss.mean()
+
+    return triplet_loss, -1
+
+
+def batch_all_triplet_loss(labels, embeddings, margin, p):
+    pairwise_dist = torch.cdist(embeddings, embeddings, p=p)
+
+    anchor_positive_dist = pairwise_dist.unsqueeze(2)
+    anchor_negative_dist = pairwise_dist.unsqueeze(1)
+
+    triplet_loss = anchor_positive_dist - anchor_negative_dist + margin
+
+    mask = _get_triplet_mask(labels)
+    triplet_loss = mask.float() * triplet_loss
+
+    triplet_loss[triplet_loss < 0] = 0
+
+    valid_triplets = triplet_loss[triplet_loss > 1e-16]
+    num_positive_triplets = valid_triplets.size(0)
+    num_valid_triplets = mask.sum()
+
+    fraction_positive_triplets = num_positive_triplets / (num_valid_triplets.float() + 1e-16)
+
+    triplet_loss = triplet_loss.sum() / (num_positive_triplets + 1e-16)
+
+    return triplet_loss, fraction_positive_triplets
+
+
+def _get_triplet_mask(labels):
+    indices_equal = torch.eye(labels.size(0), dtype=torch.bool, device=labels.device)
+    indices_not_equal = ~indices_equal
+    i_not_equal_j = indices_not_equal.unsqueeze(2)
+    i_not_equal_k = indices_not_equal.unsqueeze(1)
+    j_not_equal_k = indices_not_equal.unsqueeze(0)
+
+    distinct_indices = (i_not_equal_j & i_not_equal_k) & j_not_equal_k
+
+    label_equal = labels.unsqueeze(0) == labels.unsqueeze(1)
+    i_equal_j = label_equal.unsqueeze(2)
+    i_equal_k = label_equal.unsqueeze(1)
+
+    valid_labels = ~i_equal_k & i_equal_j
+
+    return valid_labels & distinct_indices
+
+
+def _get_anchor_positive_triplet_mask(labels):
+    indices_equal = torch.eye(labels.size(0), dtype=torch.bool, device=labels.device)
+    indices_not_equal = ~indices_equal
+
+    labels_equal = labels.unsqueeze(0) == labels.unsqueeze(1)
+
+    return labels_equal & indices_not_equal
+
+
+def _get_anchor_negative_triplet_mask(labels):
+    return labels.unsqueeze(0) != labels.unsqueeze(1)
+
+
+# ============================================================
+#  model.py (inlined)
+# ============================================================
+
+class EmbeddingNet(nn.Module):
+    def __init__(self, backbone=None):
+        super().__init__()
+        if backbone is None:
+            backbone = models.resnet50(num_classes=128)
+
+        self.backbone = backbone
+
+    def forward(self, x):
+        x = self.backbone(x)
+        x = nn.functional.normalize(x, dim=1)
+        return x
+
+
+# ============================================================
+#  sampler.py (inlined)
+# ============================================================
+
+def create_groups(groups, k):
+    """Bins sample indices with respect to groups, remove bins with less than k samples."""
+    group_samples = defaultdict(list)
+    for sample_idx, group_idx in enumerate(groups):
+        group_samples[group_idx].append(sample_idx)
+
+    keys_to_remove = []
+    for key in group_samples:
+        if len(group_samples[key]) < k:
+            keys_to_remove.append(key)
+            continue
+
+    for key in keys_to_remove:
+        group_samples.pop(key)
+
+    return group_samples
+
+
+class PKSampler(Sampler):
+    """
+    Randomly samples from a dataset while ensuring that each batch (of size p * k)
+    includes samples from exactly p labels, with k samples for each label.
+    """
+
+    def __init__(self, groups, p, k):
+        self.p = p
+        self.k = k
+        self.groups = create_groups(groups, self.k)
+
+        if len(self.groups) < p:
+            raise ValueError("There are not enough classes to sample from")
+
+    def __iter__(self):
+        for key in self.groups:
+            random.shuffle(self.groups[key])
+
+        group_samples_remaining = {}
+        for key in self.groups:
+            group_samples_remaining[key] = len(self.groups[key])
+
+        while len(group_samples_remaining) > self.p:
+            group_ids = list(group_samples_remaining.keys())
+            selected_group_idxs = torch.multinomial(torch.ones(len(group_ids)), self.p).tolist()
+            for i in selected_group_idxs:
+                group_id = group_ids[i]
+                group = self.groups[group_id]
+                for _ in range(self.k):
+                    sample_idx = len(group) - group_samples_remaining[group_id]
+                    yield group[sample_idx]
+                    group_samples_remaining[group_id] -= 1
+
+                if group_samples_remaining[group_id] < self.k:
+                    group_samples_remaining.pop(group_id)
+
+
+# ============================================================
+#  FL client API
+# ============================================================
+
+def build_model(config: dict) -> nn.Module:
+    """Instantiate and return the EmbeddingNet model.
+
+    Accepted config keys:
+        model_kwargs (dict): forwarded to EmbeddingNet.__init__.
+            Supported key: backbone (nn.Module | None).
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    return EmbeddingNet(**model_kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split.
+
+    Accepted config keys:
+        data_path (str)               : root directory for FashionMNIST (default ".").
+        local.batch_size (int)        : batch size when PKSampler is not used (default 16).
+        local.labels_per_batch (int)  : p for PKSampler on the train split (default 8).
+        local.samples_per_label (int) : k for PKSampler on the train split (default 8).
+        local.num_workers (int)       : DataLoader worker processes (default 0).
+        val_fraction (float)          : fraction of the train set held out for val (default 0.2).
+        allow_synthetic_data (bool)   : if True and real data is absent, fall back to random
+                                        tensors; if False (default) raise FileNotFoundError.
+    """
+    local_cfg = config.get("local", {})
+    batch_size = local_cfg.get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    val_fraction = config.get("val_fraction", 0.2)
+    num_workers = local_cfg.get("num_workers", 0)
+
+    transform = transforms.Compose(
+        [
+            transforms.Lambda(lambda image: image.convert("RGB")),
+            transforms.Resize((224, 224)),
+            transforms.PILToTensor(),
+            transforms.ConvertImageDtype(torch.float),
+        ]
+    )
+
+    # ---- attempt to load real dataset ----------------------------------------
+    full_dataset = None
+    load_error = None
+    try:
+        # download=True is idempotent: skips if files already exist.
+        full_dataset = FashionMNIST(data_path, train=True, transform=transform, download=True)
+    except Exception as exc:
+        load_error = exc
+
+    # ---- synthetic fallback or hard failure ----------------------------------
+    if full_dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"FashionMNIST dataset not found at '{data_path}' and could not be "
+                "downloaded. Set config['allow_synthetic_data'] = True to use synthetic "
+                "data instead."
+            ) from load_error
+
+        # Synthetic: 1 000 random RGB 224×224 images with 10 class labels.
+        n_synth = 1000
+        synth_images = torch.randn(n_synth, 3, 224, 224)
+        synth_labels = torch.randint(0, 10, (n_synth,))
+        full_dataset = TensorDataset(synth_images, synth_labels)
+        has_targets_attr = False
+    else:
+        has_targets_attr = True
+
+    # ---- train / val split ---------------------------------------------------
+    n_total = len(full_dataset)
+    n_val = max(1, int(n_total * val_fraction))
+    n_train = n_total - n_val
+
+    train_subset, val_subset = random_split(
+        full_dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    # ---- build loaders -------------------------------------------------------
+    if split == "train":
+        # Attempt PKSampler for structured P×K batches when targets are available.
+        if has_targets_attr:
+            p = local_cfg.get("labels_per_batch", 8)
+            k = local_cfg.get("samples_per_label", 8)
+            all_targets = full_dataset.targets.tolist()
+            subset_targets = [all_targets[idx] for idx in train_subset.indices]
+            try:
+                sampler = PKSampler(subset_targets, p, k)
+                return DataLoader(
+                    train_subset,
+                    batch_size=p * k,
+                    sampler=sampler,
+                    num_workers=num_workers,
+                )
+            except (ValueError, Exception):
+                # Not enough classes / samples on this client — fall through to plain shuffle.
+                pass
+
+        return DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+        )
+
+    # split == "val"
+    return DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+
+def train_step(model: nn.Module, batch, optimizer, config: dict) -> torch.Tensor:
+    """Run one forward pass and return the loss tensor (grad attached).
+
+    The FL runtime is responsible for loss.backward() and optimizer.step().
+    This function must NOT call either.
+
+    Accepted config keys:
+        margin (float) : triplet loss margin (default 0.2).
+        mining (str)   : "batch_all" or "batch_hard" (default "batch_all").
+    """
+    device = next(model.parameters()).device
+
+    samples = batch[0].to(device)
+    targets = batch[1].to(device)
+
+    margin = config.get("margin", 0.2)
+    mining = config.get("mining", "batch_all")
+    criterion = TripletMarginLoss(margin=margin, mining=mining)
+
+    embeddings = model(samples)
+    loss, _frac_pos = criterion(embeddings, targets)
+
+    # loss has grad attached via the autograd graph; do NOT call backward here.
+    return loss

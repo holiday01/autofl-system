@@ -1,0 +1,80 @@
+import numpy as np
+import keras
+from keras import layers
+
+
+def build_model(config):
+    num_classes = config.get("num_classes", 10)
+    input_shape = config.get("input_shape", (28, 28, 1))
+
+    model = keras.Sequential(
+        [
+            keras.Input(shape=input_shape),
+            layers.Conv2D(32, kernel_size=(3, 3), activation="relu"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Flatten(),
+            layers.Dropout(0.5),
+            layers.Dense(num_classes, activation="softmax"),
+        ]
+    )
+    return model
+
+
+class _NumpyLoader:
+    def __init__(self, x, y, batch_size, shuffle=False, seed=42):
+        self.x = x
+        self.y = y
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+
+    def __iter__(self):
+        idx = np.arange(len(self.x))
+        if self.shuffle:
+            rng = np.random.default_rng(self.seed)
+            rng.shuffle(idx)
+        for start in range(0, len(idx), self.batch_size):
+            b = idx[start : start + self.batch_size]
+            yield self.x[b], self.y[b]
+
+    def __len__(self):
+        return (len(self.x) + self.batch_size - 1) // self.batch_size
+
+
+def build_dataloader(config, split):
+    num_classes = config.get("num_classes", 10)
+    batch_size = config.get("batch_size", 128)
+    partition = config.get("partition", None)
+    seed = config.get("seed", 42)
+
+    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+
+    if split == "train":
+        x, y = x_train, y_train
+    elif split in ("test", "val"):
+        x, y = x_test, y_test
+    else:
+        raise ValueError(f"Unknown split: {split!r}. Expected 'train', 'val', or 'test'.")
+
+    x = x.astype("float32") / 255
+    x = np.expand_dims(x, -1)
+    y = keras.utils.to_categorical(y, num_classes)
+
+    if partition is not None:
+        start, end = partition
+        x, y = x[start:end], y[start:end]
+
+    return _NumpyLoader(x, y, batch_size=batch_size, shuffle=(split == "train"), seed=seed)
+
+
+def train_step(model, batch, optimizer, config):
+    x, y = batch
+    loss_fn = keras.losses.CategoricalCrossentropy()
+
+    if not getattr(model, "_is_compiled", False):
+        model.compile(optimizer=optimizer, loss=loss_fn, metrics=["accuracy"])
+
+    result = model.train_on_batch(x, y, return_dict=True)
+    return {"loss": float(result["loss"]), "accuracy": float(result.get("accuracy", 0.0))}

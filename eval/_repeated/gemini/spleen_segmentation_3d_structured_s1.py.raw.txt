@@ -1,0 +1,210 @@
+```python
+import logging
+import os
+import sys
+from glob import glob
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, random_split, Dataset
+
+import monai
+from monai.data import create_test_image_3d, list_data_collate
+from monai.transforms import (
+    EnsureChannelFirstd,
+    Compose,
+    LoadImaged,
+    RandCropByPosNegLabeld,
+    RandRotate90d,
+    ScaleIntensityd,
+)
+
+# Define the MONAI UNet model class as it was used in the original script.
+# This ensures the architecture is preserved exactly.
+class UNet(monai.networks.nets.UNet):
+    """
+    Wrapper for MONAI's UNet to ensure it can be instantiated directly
+    without relying on the original script's context.
+    """
+    pass
+
+# Helper to generate synthetic data, adapted from the original main function.
+def _generate_synthetic_data(data_dir: str, num_samples: int = 40):
+    """
+    Generates synthetic 3D Nifti image and segmentation pairs.
+    """
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+
+    # Check if data already exists to avoid regeneration
+    existing_images = glob(os.path.join(data_dir, "img*.nii.gz"))
+    existing_segs = glob(os.path.join(data_dir, "seg*.nii.gz"))
+    if len(existing_images) >= num_samples and len(existing_segs) >= num_samples:
+        logging.info(f"Synthetic data already found in {data_dir}. Skipping generation.")
+        return
+
+    logging.info(f"Generating {num_samples} synthetic 3D image/segmentation pairs to {data_dir}...")
+    for i in range(num_samples):
+        im, seg = create_test_image_3d(128, 128, 128, num_seg_classes=1, channel_dim=-1)
+
+        n = nib.Nifti1Image(im, np.eye(4))
+        # Use 3 digits for consistent sorting and to handle more than 100 samples easily
+        nib.save(n, os.path.join(data_dir, f"img{i:03d}.nii.gz"))
+
+        n = nib.Nifti1Image(seg, np.eye(4))
+        nib.save(n, os.path.join(data_dir, f"seg{i:03d}.nii.gz"))
+    logging.info("Synthetic data generation complete.")
+
+class MonaiFLDataset(monai.data.Dataset):
+    """
+    A wrapper for MONAI's Dataset which simplifies passing transforms.
+    """
+    def __init__(self, data, transform=None):
+        super().__init__(data, transform)
+
+def build_model(config: dict) -> torch.nn.Module:
+    """
+    Instantiate and return the MONAI UNet model.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    
+    # Default model parameters from the original script
+    default_model_kwargs = {
+        "spatial_dims": 3,
+        "in_channels": 1,
+        "out_channels": 1,
+        "channels": (16, 32, 64, 128, 256),
+        "strides": (2, 2, 2, 2),
+        "num_res_units": 2,
+    }
+    
+    # Merge user-provided kwargs with defaults, giving preference to user-provided
+    final_model_kwargs = {**default_model_kwargs, **model_kwargs}
+    
+    model = UNet(**final_model_kwargs)
+    return model
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+    Handles synthetic data fallback and uses random_split.
+    """
+    # Use the client configuration for batch_size, with a default of 2 matching original script's train_batch_size
+    batch_size = config.get("local", {}).get("batch_size", 2) 
+    data_path = config.get("data_path", ".")
+    allow_synthetic_data = config.get("allow_synthetic_data", False)
+    
+    # Ensure data_path exists and potentially generate synthetic data
+    if not os.path.exists(data_path) or not glob(os.path.join(data_path, "img*.nii.gz")):
+        if allow_synthetic_data:
+            logging.info(f"Data not found at '{data_path}', generating synthetic data.")
+            _generate_synthetic_data(data_path)
+        else:
+            raise FileNotFoundError(
+                f"No Nifti data found at '{data_path}' and 'allow_synthetic_data' is False. "
+                "Please provide data (e.g., 'img*.nii.gz', 'seg*.nii.gz') or enable synthetic data generation "
+                "in your client configuration."
+            )
+
+    images = sorted(glob(os.path.join(data_path, "img*.nii.gz")))
+    segs = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+    
+    if not images or not segs:
+        # This check is in case synthetic data generation failed or only partial files exist
+        raise FileNotFoundError(f"Could not find Nifti image or segmentation files in '{data_path}' after checks. "
+                                "Ensure files like 'img*.nii.gz' and 'seg*.nii.gz' exist and are accessible.")
+
+    all_files = [{"img": img, "seg": seg} for img, seg in zip(images, segs)]
+    
+    # Define transforms for image and segmentation, as in the original script
+    train_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+            RandCropByPosNegLabeld(
+                keys=["img", "seg"], label_key="seg", spatial_size=[96, 96, 96], pos=1, neg=1, num_samples=4
+            ),
+            RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
+        ]
+    )
+    val_transforms = Compose(
+        [
+            LoadImaged(keys=["img", "seg"]),
+            EnsureChannelFirstd(keys=["img", "seg"]),
+            ScaleIntensityd(keys="img"),
+        ]
+    )
+
+    # Use a consistent seed for reproducibility of random_split
+    # The seed can be provided in the config, default to 42.
+    seed = config.get("seed", 42)
+    g = torch.Generator().manual_seed(seed)
+
+    # Calculate split sizes. The original script used 20 train, 20 val from 40 total.
+    # So, a 50/50 split is appropriate here by default, or can be made configurable.
+    train_ratio = config.get("data_split_ratio", {}).get("train", 0.5)
+    total_samples = len(all_files)
+    train_size = int(train_ratio * total_samples)
+    val_size = total_samples - train_size
+    
+    # Perform the random split using torch.utils.data.random_split on indices
+    train_subset_indices, val_subset_indices = random_split(
+        range(total_samples), # Split indices, not the dataset itself
+        [train_size, val_size],
+        generator=g
+    )
+
+    # Create new MonaiFLDataset instances with the appropriate data and transforms for each split
+    if split == "train":
+        # Extract the actual data items corresponding to the train indices
+        split_files = [all_files[i] for i in train_subset_indices.indices]
+        dataset = MonaiFLDataset(data=split_files, transform=train_transforms)
+        shuffle = True
+    elif split == "val":
+        # Extract the actual data items corresponding to the val indices
+        split_files = [all_files[i] for i in val_subset_indices.indices]
+        dataset = MonaiFLDataset(data=split_files, transform=val_transforms)
+        shuffle = False # Typically no shuffle for validation
+    else:
+        raise ValueError(f"Invalid split: {split}. Expected 'train' or 'val'.")
+
+    # num_workers and pin_memory based on original script, made configurable
+    num_workers = config.get("local", {}).get("num_workers", 4)
+    pin_memory = config.get("local", {}).get("pin_memory", torch.cuda.is_available())
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=list_data_collate,
+        pin_memory=pin_memory,
+    )
+
+def train_step(model, batch, optimizer, config: dict) -> torch.Tensor:
+    """
+    Run ONE forward pass. Return the loss tensor WITH grad attached.
+    Do NOT call loss.backward() or optimizer.step().
+    """
+    # Determine the device of the model parameters
+    device = next(model.parameters()).device
+
+    # Instantiate loss function. This is stateless so creating it each step is fine.
+    # If it had state, it should be created once in a setup function and passed.
+    loss_function = monai.losses.DiceLoss(sigmoid=True)
+
+    # Move batch data to the model's device
+    # The batch from MONAI DataLoader is a dictionary
+    inputs = batch["img"].to(device)
+    labels = batch["seg"].to(device)
+
+    # Forward pass
+    outputs = model(inputs)
+
+    # Calculate loss
+    loss = loss_function(outputs, labels)
+
+    return loss
+```

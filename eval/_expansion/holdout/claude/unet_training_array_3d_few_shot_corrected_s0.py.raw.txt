@@ -1,0 +1,152 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: MONAI 3D UNet segmentation training.
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import tempfile
+from glob import glob
+
+import nibabel as nib
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+import monai
+from monai.data import ImageDataset, create_test_image_3d
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirst,
+    RandRotate90,
+    RandSpatialCrop,
+    ScaleIntensity,
+)
+
+
+# ── Transforms ──────────────────────────────────────────────────────────
+
+def _train_transforms(crop_size=(96, 96, 96)):
+    img = Compose([
+        ScaleIntensity(),
+        EnsureChannelFirst(),
+        RandSpatialCrop(crop_size, random_size=False),
+        RandRotate90(prob=0.5, spatial_axes=(0, 2)),
+    ])
+    seg = Compose([
+        EnsureChannelFirst(),
+        RandSpatialCrop(crop_size, random_size=False),
+        RandRotate90(prob=0.5, spatial_axes=(0, 2)),
+    ])
+    return img, seg
+
+
+def _val_transforms():
+    return Compose([ScaleIntensity(), EnsureChannelFirst()]), Compose([EnsureChannelFirst()])
+
+
+# ── FL Interface ─────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kw = config.get("model_kwargs", {})
+    return monai.networks.nets.UNet(
+        spatial_dims=kw.get("spatial_dims", 3),
+        in_channels=kw.get("in_channels", 1),
+        out_channels=kw.get("out_channels", 1),
+        channels=tuple(kw.get("channels", (16, 32, 64, 128, 256))),
+        strides=tuple(kw.get("strides", (2, 2, 2, 2))),
+        num_res_units=kw.get("num_res_units", 2),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    num_workers = local.get("num_workers", config.get("num_workers", 4))
+    pin_memory  = local.get("pin_memory", True)
+    crop_size   = tuple(config.get("crop_size", (96, 96, 96)))
+    val_ratio   = config.get("val_ratio", 0.5)
+
+    data_path = config.get("data_path", ".")
+    images = sorted(glob(os.path.join(data_path, "im*.nii.gz")))
+    segs   = sorted(glob(os.path.join(data_path, "seg*.nii.gz")))
+
+    if not images:
+        # synthetic fallback for testing
+        tmpdir   = config.get("_synthetic_tmpdir") or tempfile.mkdtemp()
+        n_synth  = config.get("n_synthetic", 40)
+        for i in range(n_synth):
+            im_p  = os.path.join(tmpdir, f"im{i:d}.nii.gz")
+            seg_p = os.path.join(tmpdir, f"seg{i:d}.nii.gz")
+            if not os.path.exists(im_p):
+                im, seg = create_test_image_3d(128, 128, 128, num_seg_classes=1)
+                nib.save(nib.Nifti1Image(im,  np.eye(4)), im_p)
+                nib.save(nib.Nifti1Image(seg, np.eye(4)), seg_p)
+        images = sorted(glob(os.path.join(tmpdir, "im*.nii.gz")))
+        segs   = sorted(glob(os.path.join(tmpdir, "seg*.nii.gz")))
+
+    n_val   = max(1, int(len(images) * val_ratio))
+    n_train = len(images) - n_val
+
+    if split == "train":
+        img_trans, seg_trans = _train_transforms(crop_size)
+        batch_size = local.get("batch_size", config.get("batch_size", 4))
+        ds = ImageDataset(images[:n_train], segs[:n_train],
+                          transform=img_trans, seg_transform=seg_trans)
+        shuffle = True
+    else:
+        img_trans, seg_trans = _val_transforms()
+        batch_size = local.get("batch_size", config.get("val_batch_size", 1))
+        ds = ImageDataset(images[n_train:], segs[n_train:],
+                          transform=img_trans, seg_transform=seg_trans)
+        shuffle = False
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    criterion = monai.losses.DiceLoss(sigmoid=True)
+    loss = criterion(outputs, targets)
+    return loss
+```

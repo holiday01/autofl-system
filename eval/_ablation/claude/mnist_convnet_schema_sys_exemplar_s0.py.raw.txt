@@ -1,0 +1,186 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: Simple MNIST convnet (Keras → PyTorch conversion).
+
+Exposes:
+  build_model(config)                       -> nn.Module
+  build_dataloader(config, split)           -> DataLoader
+  train_step(model, batch, opt, config)     -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
+
+try:
+    import torchvision
+    import torchvision.transforms as transforms
+    _TORCHVISION_AVAILABLE = True
+except ImportError:
+    _TORCHVISION_AVAILABLE = False
+
+
+# ── Model (Keras Sequential → torch.nn.Module) ───────────────────────────────
+#
+#   Keras layer                              PyTorch equivalent
+#   ─────────────────────────────────────────────────────────────
+#   Input(shape=(28,28,1))                   — implicit, channels-last→first
+#   Conv2D(32, (3,3), activation="relu")     Conv2d(1, 32, 3) + ReLU
+#   MaxPooling2D(pool_size=(2,2))            MaxPool2d(2)
+#   Conv2D(64, (3,3), activation="relu")     Conv2d(32, 64, 3) + ReLU
+#   MaxPooling2D(pool_size=(2,2))            MaxPool2d(2)
+#   Flatten()                                Flatten()
+#   Dropout(0.5)                             Dropout(0.5)
+#   Dense(10, activation="softmax")          Linear(1600, 10)  ← logits only;
+#                                            CrossEntropyLoss applies log-softmax
+#
+#   Feature-map math (no padding):
+#     28×28 ──Conv2d(3)──> 26×26 ──MaxPool(2)──> 13×13
+#          ──Conv2d(3)──> 11×11 ──MaxPool(2)──>  5× 5
+#     Flatten: 64 × 5 × 5 = 1600
+
+class MNISTConvNet(nn.Module):
+    """
+    PyTorch equivalent of the original Keras MNIST convnet.
+    Achieves ~99% test accuracy on MNIST with the same architecture.
+    """
+
+    def __init__(self, num_classes: int = 10, dropout: float = 0.5):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=0),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=0),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(64 * 5 * 5, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        return self.classifier(x)
+
+
+# ── FL Interface ──────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return MNISTConvNet(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 16))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+    data_path   = config.get("data_path", ".")
+    val_ratio   = config.get("val_ratio", 0.1)
+    seed        = config.get("seed", 42)
+
+    full_dataset = None
+
+    if _TORCHVISION_AVAILABLE:
+        transform = transforms.Compose([
+            transforms.ToTensor(),  # PIL/numpy uint8 [0,255] → float32 [0,1], shape (1,28,28)
+        ])
+        try:
+            full_dataset = torchvision.datasets.MNIST(
+                root=data_path,
+                train=True,
+                transform=transform,
+                download=False,
+            )
+        except Exception:
+            full_dataset = None  # data not pre-staged; fall through to synthetic check
+
+    if full_dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"MNIST dataset not found at '{data_path}' and "
+                "'allow_synthetic_data' is False. "
+                "Either pre-stage the MNIST files at that path or set "
+                "config['allow_synthetic_data'] = True to use synthetic data."
+            )
+        # Synthetic fallback: 1 000 random 1×28×28 images, integer labels 0-9
+        n_synthetic = 1000
+        X = torch.randn(n_synthetic, 1, 28, 28)
+        y = torch.randint(0, 10, (n_synthetic,))
+        full_dataset = TensorDataset(X, y)
+
+    n_val   = max(1, int(len(full_dataset) * val_ratio))
+    n_train = len(full_dataset) - n_val
+    train_ds, val_ds = random_split(
+        full_dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(seed),
+    )
+    ds = train_ds if split == "train" else val_ds
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass. Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs, targets = batch[0], batch[1]
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    # ── Input normalisation guards ───────────────────────────────────────────
+    # Ensure float32 in [0, 1] with shape (B, 1, 28, 28)
+    if inputs.dtype != torch.float32:
+        inputs = inputs.float()
+    if inputs.ndim == 3:          # (B, H, W) → (B, 1, H, W)
+        inputs = inputs.unsqueeze(1)
+    if inputs.max() > 1.0:       # raw uint8 [0, 255] → [0, 1]
+        inputs = inputs / 255.0
+
+    # ── Target normalisation guards ──────────────────────────────────────────
+    # CrossEntropyLoss expects Long class indices, not one-hot vectors
+    if targets.ndim > 1:          # one-hot (B, C) → (B,)
+        targets = targets.argmax(dim=1)
+    targets = targets.long()
+
+    outputs = model(inputs)
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(outputs, targets)
+    return loss  # grad_fn attached; FL runtime owns backward() + step()
+```

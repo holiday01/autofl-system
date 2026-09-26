@@ -1,0 +1,206 @@
+import math
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+
+
+class Generator(nn.Module):
+    """
+    >>> Generator(img_shape=(1, 8, 8))  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    Generator(
+      (model): Sequential(...)
+    )
+    """
+
+    def __init__(self, latent_dim: int = 100, img_shape: tuple = (1, 28, 28)):
+        super().__init__()
+        self.img_shape = img_shape
+
+        def block(in_feat, out_feat, normalize=True):
+            layers = [nn.Linear(in_feat, out_feat)]
+            if normalize:
+                layers.append(nn.BatchNorm1d(out_feat, 0.8))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *block(latent_dim, 128, normalize=False),
+            *block(128, 256),
+            *block(256, 512),
+            *block(512, 1024),
+            nn.Linear(1024, int(math.prod(img_shape))),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        img = self.model(z)
+        return img.view(img.size(0), *self.img_shape)
+
+
+class Discriminator(nn.Module):
+    """
+    >>> Discriminator(img_shape=(1, 28, 28))  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    Discriminator(
+      (model): Sequential(...)
+    )
+    """
+
+    def __init__(self, img_shape):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(int(math.prod(img_shape)), 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 1),
+        )
+
+    def forward(self, img):
+        img_flat = img.view(img.size(0), -1)
+        return self.model(img_flat)
+
+
+class GAN_FL(nn.Module):
+    """
+    A wrapper module for the Generator and Discriminator to be used in Federated Learning.
+    The forward pass of this module is the generator's forward pass.
+    """
+
+    def __init__(
+        self,
+        img_shape: tuple = (1, 28, 28),
+        latent_dim: int = 100,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.img_shape = img_shape
+
+        # networks
+        self.generator = Generator(latent_dim=self.latent_dim, img_shape=img_shape)
+        self.discriminator = Discriminator(img_shape=img_shape)
+
+    def forward(self, z):
+        # The primary forward pass for this model is the generator
+        return self.generator(z)
+
+    @staticmethod
+    def adversarial_loss(y_hat, y):
+        return F.binary_cross_entropy_with_logits(y_hat, y)
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    """
+    Instantiate and return the GAN_FL model.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    return GAN_FL(**model_kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+    Includes a synthetic data fallback.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    allow_synthetic_data = config.get("allow_synthetic_data", False)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+    ])
+
+    full_dataset = None
+    try:
+        # Attempt to load real MNIST data
+        full_dataset = datasets.MNIST(root=data_path, train=True, download=True, transform=transform)
+    except Exception as e:
+        if allow_synthetic_data:
+            print(f"Warning: Could not load real MNIST data from {data_path}. Using synthetic data. Error: {e}")
+            # Use default img_shape (1, 28, 28) for synthetic data if not specified
+            img_shape = config.get("model_kwargs", {}).get("img_shape", (1, 28, 28))
+
+            class SyntheticMNISTDataset(Dataset):
+                def __init__(self, num_samples=60000, img_shape=(1, 28, 28)):
+                    self.num_samples = num_samples
+                    # Generate images in the normalized range [-1, 1]
+                    self.images = torch.rand(num_samples, *img_shape) * 2 - 1
+                    self.labels = torch.randint(0, 10, (num_samples,))
+                def __len__(self):
+                    return self.num_samples
+                def __getitem__(self, idx):
+                    return self.images[idx], self.labels[idx]
+
+            full_dataset = SyntheticMNISTDataset(img_shape=img_shape)
+        else:
+            raise FileNotFoundError(
+                f"Failed to load MNIST dataset from {data_path}. "
+                "Set 'allow_synthetic_data: True' in config to use synthetic data instead, "
+                "or ensure the dataset is available at the specified path."
+            ) from e
+
+    # Determine splits
+    # Use a fixed seed for reproducibility of the split
+    total_len = len(full_dataset)
+    train_len = int(total_len * 0.9)
+    val_len = total_len - train_len
+    # Ensure consistent splits across clients for evaluation purposes
+    train_dataset, val_dataset = random_split(full_dataset, [train_len, val_len], generator=torch.Generator().manual_seed(42))
+
+    if split == "train":
+        return DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    elif split == "val":
+        return DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    else:
+        raise ValueError(f"Invalid split: {split}. Must be 'train' or 'val'.")
+
+
+def train_step(model: GAN_FL, batch, optimizer, config: dict) -> torch.Tensor:
+    """
+    Run ONE forward pass only for the generator and return its loss tensor WITH grad attached.
+    The FL runtime handles loss.backward() and optimizer.step().
+    """
+    imgs, _ = batch
+    device = next(model.parameters()).device  # Get model's device
+
+    # Move data to the model's device
+    imgs = imgs.to(device)
+
+    # Generate noise for the generator
+    z = torch.randn(imgs.shape[0], model.latent_dim, device=device)
+
+    # --- Generator Training Objective ---
+    # The FL runtime will apply backward() and step() based on the returned loss.
+    # We choose the generator's loss as the primary objective for FL here.
+    # The discriminator is used for inference to compute generator's loss,
+    # but its own optimization step is not directly handled by the FL runtime
+    # based on this single returned loss.
+
+    # Create ground truth label for generated images (label them as real for generator's objective)
+    valid = torch.ones(imgs.size(0), 1, device=device)
+
+    # Generator forward pass: model(z) calls model.generator(z)
+    fake_imgs = model(z)
+    # Discriminator forward pass on generated images to compute generator's loss
+    g_loss = model.adversarial_loss(model.discriminator(fake_imgs), valid)
+
+    # Note: The original GAN training involves a separate discriminator update
+    # which calculates d_loss and calls opt_d.step().
+    # Due to the constraints ("Run ONE forward pass only", "Return the loss tensor WITH grad attached",
+    # "Do NOT call loss.backward() or optimizer.step()"), we cannot perform
+    # the full sequential GAN update with two distinct backward/step calls
+    # for generator and discriminator within this single `train_step` function
+    # and return a single loss for the FL runtime.
+
+    # Therefore, this implementation focuses on returning the generator's loss,
+    # implying that the FL server will primarily aggregate generator parameters.
+    # The discriminator's parameters will only be updated indirectly through
+    # its role in computing g_loss, but its own adversarial objective
+    # (distinguishing real vs. fake) is not directly optimized by the FL runtime
+    # in this train_step.
+    return g_loss

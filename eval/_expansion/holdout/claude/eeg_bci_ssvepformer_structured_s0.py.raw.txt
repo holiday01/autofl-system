@@ -1,0 +1,237 @@
+    """Non-trainable FFT feature layer.
+
+    Input  : (B, C, T)
+    Output : (B, C, 2·F)  where F = fft_end - fft_start
+    """
+    def __init__(self, nfft=512, fft_start=8, fft_end=64):
+        super().__init__()
+        self.nfft      = nfft
+        self.fft_start = fft_start
+        self.fft_end   = fft_end
+
+    def forward(self, x):
+        samples = x.shape[-1]
+        fft_out = torch.fft.rfft(x, n=self.nfft)
+        real    = fft_out.real / samples
+        imag    = fft_out.imag / samples
+        real    = real[..., self.fft_start:self.fft_end]
+        imag    = imag[..., self.fft_start:self.fft_end]
+        return torch.cat([real, imag], dim=-1)
+
+
+class ChannelComb(nn.Module):
+    """Conv1D(2C, 1) + LayerNorm + GELU + Dropout.  (B,C,2F) → (B,2C,2F)"""
+    def __init__(self, n_channels, n_freq_out, drop_rate=0.5):
+        super().__init__()
+        self.conv = nn.Conv1d(n_channels, 2 * n_channels, kernel_size=1)
+        nn.init.normal_(self.conv.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.conv.bias)
+        self.normalization = nn.LayerNorm(n_freq_out)
+        self.activation    = nn.GELU()
+        self.drop          = nn.Dropout(drop_rate)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.normalization(x)
+        x = self.activation(x)
+        x = self.drop(x)
+        return x
+
+
+class ConvAttention(nn.Module):
+    """LayerNorm + Conv1D(2C,31,same) + GELU + Dropout + residual.  (B,2C,2F) → same"""
+    def __init__(self, n_channels, n_freq_out, drop_rate=0.5):
+        super().__init__()
+        self.norm = nn.LayerNorm(n_freq_out)
+        self.conv = nn.Conv1d(2 * n_channels, 2 * n_channels, kernel_size=31, padding=15)
+        nn.init.normal_(self.conv.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.conv.bias)
+        self.activation = nn.GELU()
+        self.drop       = nn.Dropout(drop_rate)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = self.conv(x)
+        x = self.activation(x)
+        x = self.drop(x)
+        return x + residual
+
+
+class ChannelMLP(nn.Module):
+    """Per-frequency-position channel mixing with residual.
+
+    Mirrors the Keras ChannelMLP: for i in range(C), apply Dense to x[:,:,i]
+    then reconstruct along the channel axis.
+    Input/Output : (B, 2C, 2F)
+    """
+    def __init__(self, n_channels_comb, n_features, drop_rate=0.5):
+        super().__init__()
+        self.norm = nn.LayerNorm(2 * n_features)
+        self.mlp  = nn.Linear(n_channels_comb, 2 * n_features)
+        nn.init.normal_(self.mlp.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.mlp.bias)
+        self.activation = nn.GELU()
+        self.drop       = nn.Dropout(drop_rate)
+
+    def forward(self, x):
+        residual = x
+        x        = self.norm(x)
+        channels = x.shape[1]
+        out_list = []
+        for i in range(channels):
+            c = self.mlp(x[:, :, i])        # (B, C) → (B, 2F)
+            out_list.append(c.unsqueeze(1))  # (B, 1, 2F)
+        x = torch.cat(out_list, dim=1)       # (B, C, 2F)
+        x = self.activation(x)
+        x = self.drop(x)
+        return x + residual
+
+
+class Encoder(nn.Module):
+    """Two successive (ConvAttention + ChannelMLP) sub-blocks."""
+    def __init__(self, n_channels, n_features, n_freq_out, drop_rate=0.5):
+        super().__init__()
+        self.attention1 = ConvAttention(n_channels, n_freq_out, drop_rate=drop_rate)
+        self.mlp1       = ChannelMLP(2 * n_channels, n_features, drop_rate=drop_rate)
+        self.attention2 = ConvAttention(n_channels, n_freq_out, drop_rate=drop_rate)
+        self.mlp2       = ChannelMLP(2 * n_channels, n_features, drop_rate=drop_rate)
+
+    def forward(self, x):
+        x = self.attention1(x)
+        x = self.mlp1(x)
+        x = self.attention2(x)
+        x = self.mlp2(x)
+        return x
+
+
+class MlpHead(nn.Module):
+    """Flatten + Drop + Dense(6K) + LayerNorm + GELU + Drop + Dense(K)."""
+    def __init__(self, n_channels, n_features, n_classes, drop_rate=0.5):
+        super().__init__()
+        flatten_size    = 2 * n_channels * 2 * n_features
+        self.flatten    = nn.Flatten()
+        self.drop       = nn.Dropout(drop_rate)
+        self.linear1    = nn.Linear(flatten_size, 6 * n_classes)
+        nn.init.normal_(self.linear1.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.linear1.bias)
+        self.norm       = nn.LayerNorm(6 * n_classes)
+        self.activation = nn.GELU()
+        self.drop2      = nn.Dropout(drop_rate)
+        self.linear2    = nn.Linear(6 * n_classes, n_classes)
+        nn.init.normal_(self.linear2.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, x):
+        x = self.flatten(x)
+        x = self.drop(x)
+        x = self.linear1(x)
+        x = self.norm(x)
+        x = self.activation(x)
+        x = self.drop2(x)
+        x = self.linear2(x)
+        return x
+
+
+class SSVEPFormer(nn.Module):
+    """SSVEPFormer: ComplexSpectrum → ChannelComb → Encoder × 2 → MlpHead."""
+    def __init__(self, n_channels=8, n_classes=12, fs=256,
+                 resolution=0.25, band=None, drop_rate=0.5):
+        super().__init__()
+        if band is None:
+            band = [8, 64]
+        nfft       = round(fs / resolution)
+        fft_start  = int(band[0] / resolution)
+        fft_end    = int(band[1] / resolution) + 1
+        n_features = fft_end - fft_start
+        n_freq_out = 2 * n_features
+
+        self.complex_spectrum = ComplexSpectrum(nfft, fft_start, fft_end)
+        self.channel_comb     = ChannelComb(n_channels, n_freq_out, drop_rate)
+        self.encoder1         = Encoder(n_channels, n_features, n_freq_out, drop_rate)
+        self.encoder2         = Encoder(n_channels, n_features, n_freq_out, drop_rate)
+        self.mlp_head         = MlpHead(n_channels, n_features, n_classes, drop_rate)
+
+    def forward(self, x):
+        x = self.complex_spectrum(x)
+        x = self.channel_comb(x)
+        x = self.encoder1(x)
+        x = self.encoder2(x)
+        x = self.mlp_head(x)
+        return x
+
+
+# ─── FL Client API ─────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kw = config.get("model_kwargs", {})
+    return SSVEPFormer(
+        n_channels = kw.get("n_channels", 8),
+        n_classes  = kw.get("n_classes",  12),
+        fs         = kw.get("fs",         256),
+        resolution = kw.get("resolution", 0.25),
+        band       = kw.get("band",       [8, 64]),
+        drop_rate  = kw.get("drop_rate",  0.5),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path  = config.get("data_path", ".")
+    kw         = config.get("model_kwargs", {})
+    band       = kw.get("band",       [8, 64])
+    fs         = kw.get("fs",         256)
+    duration   = kw.get("duration",   1.0)
+    n_channels = kw.get("n_channels", 8)
+    n_classes  = kw.get("n_classes",  12)
+
+    dataset  = None
+    load_exc = None
+
+    first_mat = os.path.join(data_path, "s1.mat")
+    if os.path.isfile(first_mat):
+        try:
+            X, Y = segment_eeg(data_path, band=band, fs=fs, duration=duration)
+            n_subj, n_samp, n_ch, n_trials = X.shape
+            X = X.transpose(0, 3, 2, 1).reshape(-1, n_ch, n_samp).copy()
+            Y = Y.reshape(-1).astype(np.int64) - 1
+            dataset = TensorDataset(torch.from_numpy(X), torch.from_numpy(Y))
+        except Exception as exc:
+            load_exc = exc
+    else:
+        load_exc = FileNotFoundError(
+            f"Expected Nakanishi et al. .mat files (s1.mat … s10.mat) in '{data_path}'."
+        )
+
+    if dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Real EEG data not found at '{data_path}'. "
+                "Provide the dataset files (s1.mat … s10.mat) or set "
+                "config['allow_synthetic_data'] = True to use synthetic data for testing."
+            ) from load_exc
+        n_time  = int(duration * fs)
+        X_syn   = torch.randn(200, n_channels, n_time)
+        Y_syn   = torch.randint(0, n_classes, (200,))
+        dataset = TensorDataset(X_syn, Y_syn)
+
+    val_size   = max(1, int(0.2 * len(dataset)))
+    train_size = len(dataset) - val_size
+    train_ds, val_ds = random_split(
+        dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen = train_ds if split == "train" else val_ds
+    return DataLoader(chosen, batch_size=batch_size,
+                      shuffle=(split == "train"), drop_last=False)
+
+
+def train_step(model: nn.Module, batch, optimizer, config: dict) -> torch.Tensor:
+    device = next(model.parameters()).device
+    x, y   = batch
+    x      = x.to(device)
+    y      = y.to(device)
+    logits = model(x)
+    loss   = F.cross_entropy(logits, y)
+    return loss

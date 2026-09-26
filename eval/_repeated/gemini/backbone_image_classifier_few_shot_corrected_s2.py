@@ -1,0 +1,163 @@
+"""
+Auto-generated FL client module.
+Original script: backbone_image_classifier.py
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import os
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms
+from torchvision.datasets import MNIST
+
+
+class Backbone(nn.Module):
+    """
+    The core neural network model from the original script.
+    """
+
+    def __init__(self, hidden_dim=128):
+        super().__init__()
+        self.l1 = nn.Linear(28 * 28, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.l1(x))
+        return F.relu(self.l2(x))
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Builds and returns the PyTorch model for the FL client.
+
+    Args:
+        config (dict): A dictionary containing configuration parameters,
+                       including 'model_kwargs' for model-specific arguments.
+
+    Returns:
+        nn.Module: The instantiated neural network model.
+    """
+    kwargs = config.get("model_kwargs", {})
+    hidden_dim = kwargs.get("hidden_dim", 128)
+    return Backbone(hidden_dim=hidden_dim)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Builds and returns a PyTorch DataLoader for the specified data split.
+
+    Args:
+        config (dict): A dictionary containing configuration parameters,
+                       including 'local' for local client settings,
+                       'data_path', 'batch_size', 'num_workers', 'seed', and 'n_val'.
+        split (str): The data split to create ('train', 'val', 'test', 'predict').
+
+    Returns:
+        DataLoader: The instantiated DataLoader.
+    """
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 32))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    # In the original script, DATASETS_PATH is relative and local.
+    # For an FL client, a configurable root path is preferred.
+    data_path = config.get("data_path", "./data")
+
+    transform = transforms.ToTensor()
+
+    if split in ("train", "val"):
+        full_train_val_dataset = MNIST(root=data_path, train=True, download=True, transform=transform)
+        
+        # The original script uses fixed counts: 55000 for training, 5000 for validation
+        total_train_val_len = len(full_train_val_dataset) # Expected 60000
+        n_val = config.get("n_val", 5000) # Default to original script's 5000 validation samples
+        
+        # Ensure n_val is valid and calculate n_train
+        if n_val >= total_train_val_len:
+            # If n_val is too large, use all data for training, no explicit validation split
+            n_val = 0
+            n_train = total_train_val_len
+        else:
+            n_train = total_train_val_len - n_val
+
+        generator = torch.Generator().manual_seed(config.get("seed", 42))
+        
+        if n_val == 0:
+            train_ds = full_train_val_dataset
+            val_ds = None
+        else:
+            train_ds, val_ds = random_split(
+                full_train_val_dataset, [n_train, n_val], generator=generator
+            )
+
+        ds = train_ds if split == "train" else val_ds
+        if ds is None and split == "val":
+            raise ValueError(f"Validation dataset requested for split='{split}' but no validation data is configured (n_val=0).")
+
+    elif split in ("test", "predict"):
+        # The original MyDataModule maps both test and predict to the same test set.
+        ds = MNIST(root=data_path, train=False, download=True, transform=transform)
+    else:
+        raise ValueError(f"Unknown split: {split}. Expected one of 'train', 'val', 'test', 'predict'.")
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"), # Only shuffle training data
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,  # optimizer is passed but not used internally, as per contract
+    config: dict,
+) -> torch.Tensor:
+    """
+    Performs one forward pass and computes the loss.
+
+    Args:
+        model (nn.Module): The neural network model.
+        batch (tuple | list | dict): A batch of data from the DataLoader.
+        optimizer: The optimizer (not used internally by this function).
+        config (dict): A dictionary containing configuration parameters.
+
+    Returns:
+        torch.Tensor: The raw loss tensor (with grad_fn attached).
+    """
+    device = next(model.parameters()).device
+    
+    # MNIST DataLoader yields (image, label) tuples.
+    if isinstance(batch, (list, tuple)):
+        inputs, targets = batch[0].to(device), batch[1].to(device)
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs)
+    loss = F.cross_entropy(outputs, targets)
+    
+    return loss

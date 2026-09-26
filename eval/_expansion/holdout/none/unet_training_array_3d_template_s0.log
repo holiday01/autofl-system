@@ -1,0 +1,13 @@
+<frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+  Preflight [eval-client]: PASS  (15.0s)
+  Preflight [eval-site-1]: PASS
+
+Starting FL: 1 rounds, 1 clients
+==================================================
+
+Round 1/1
+    [eval-site-1] loss=0.5997  steps=4  n=16  5.22s
+  Aggregated loss: 0.5997  (5.3s)
+
+FL training complete.
+EVALJSON {"syntax_valid": true, "interface_complete": true, "build_model_present": true, "build_dataloader_present": true, "train_step_present": true, "optimizer_detected": true, "preflight_pass": true, "e2e_runnable": true, "error_stage": "", "error_message": "", "elapsed_sec": 20.33, "data_path": ".", "data_path_exists": true, "strict_data": false, "spec_version": "n/a", "dataset_class": "ImageDataset", "dataset_len": 20, "component_coverage": 1.0}

@@ -1,0 +1,179 @@
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from os import path
+from typing import Optional
+
+import torch
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+from lightning.pytorch.utilities.imports import _TORCHVISION_AVAILABLE
+
+if _TORCHVISION_AVAILABLE:
+    from torchvision import transforms
+    from torchvision.datasets import MNIST
+
+
+class Backbone(torch.nn.Module):
+    """
+    >>> Backbone()  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    Backbone(
+      (l1): Linear(...)
+      (l2): Linear(...)
+    )
+    """
+
+    def __init__(self, hidden_dim=128):
+        super().__init__()
+        self.l1 = torch.nn.Linear(28 * 28, hidden_dim)
+        self.l2 = torch.nn.Linear(hidden_dim, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.l1(x))
+        return torch.relu(self.l2(x))
+
+
+def build_model(config: dict) -> torch.nn.Module:
+    """Instantiate and return the Backbone model.
+
+    Args:
+        config: FL config dict. Reads config.get("model_kwargs", {}) for
+                constructor arguments (e.g. {"hidden_dim": 256}).
+
+    Returns:
+        A freshly constructed Backbone instance.
+    """
+    model_kwargs = config.get("model_kwargs", {})
+    return Backbone(**model_kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for the requested split.
+
+    Attempts to load MNIST from *data_path*.  If the dataset is absent:
+      - allow_synthetic_data=False  →  raises FileNotFoundError (default, safe)
+      - allow_synthetic_data=True   →  returns a DataLoader backed by random
+                                       tensors so the FL pipeline can still run.
+
+    Args:
+        config: FL config dict with optional keys:
+            "data_path"            (str)  – root directory that contains the
+                                            raw MNIST files (default ".").
+            "local.batch_size"     (int)  – mini-batch size (default 16).
+            "allow_synthetic_data" (bool) – gate for the synthetic fallback
+                                            (default False).
+        split: "train" or "val".
+
+    Returns:
+        A DataLoader for the requested split.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+
+    # ------------------------------------------------------------------ #
+    # Try to load real MNIST                                               #
+    # ------------------------------------------------------------------ #
+    full_dataset = None
+
+    if _TORCHVISION_AVAILABLE:
+        try:
+            transform = transforms.ToTensor()
+            full_dataset = MNIST(
+                root=data_path,
+                train=True,
+                download=False,   # never silently download on a client node
+                transform=transform,
+            )
+        except Exception:
+            full_dataset = None
+
+    # ------------------------------------------------------------------ #
+    # Synthetic fallback – strictly gated                                 #
+    # ------------------------------------------------------------------ #
+    if full_dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"MNIST dataset not found at '{data_path}' "
+                "(torchvision may also be unavailable). "
+                "Either supply a valid data_path that already contains the "
+                "MNIST raw files, or set config['allow_synthetic_data'] = True "
+                "to proceed with randomly-generated tensors."
+            )
+
+        # Proportions mirror the original 55 000 / 5 000 split at small scale.
+        n_samples = 550 if split == "train" else 50
+        images = torch.randn(n_samples, 1, 28, 28)
+        labels = torch.randint(0, 10, (n_samples,))
+        synthetic_ds = TensorDataset(images, labels)
+        return DataLoader(
+            synthetic_ds,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Real data: reproduce the original 55 000 / 5 000 proportion        #
+    # ------------------------------------------------------------------ #
+    total = len(full_dataset)                   # 60 000 for standard MNIST
+    val_size = max(1, round(total * (5_000 / 60_000)))
+    train_size = total - val_size
+
+    train_subset, val_subset = random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen = train_subset if split == "train" else val_subset
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+    )
+
+
+def train_step(
+    model: torch.nn.Module,
+    batch,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """Run one forward pass and return the loss tensor with gradients attached.
+
+    The FL runtime is responsible for calling loss.backward() and
+    optimizer.step(); this function must NOT do either.
+
+    Args:
+        model:     The Backbone returned by build_model().
+        batch:     A (images, labels) tuple as produced by build_dataloader().
+        optimizer: Provided by the FL runtime (unused here but kept in
+                   signature for interface compliance).
+        config:    FL config dict (reserved for future use).
+
+    Returns:
+        Scalar cross-entropy loss tensor with grad_fn attached.
+    """
+    device = next(model.parameters()).device
+
+    x, y = batch
+    x = x.to(device)
+    y = y.to(device)
+
+    y_hat = model(x)
+    loss = F.cross_entropy(y_hat, y)
+
+    # Do NOT call loss.backward() or optimizer.step() here.
+    return loss

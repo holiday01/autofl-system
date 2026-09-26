@@ -1,0 +1,181 @@
+```python
+import os
+import numpy as np
+import keras
+from keras import layers
+from tensorflow import data as tf_data
+import tensorflow as tf # Explicitly import tensorflow for Tensor type hinting
+
+
+# ── Internal Helper Functions (from original script) ────────────────────
+
+data_augmentation_layers = [
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.1),
+]
+
+
+def data_augmentation(images):
+    for layer in data_augmentation_layers:
+        images = layer(images)
+    return images
+
+
+def make_model(input_shape, num_classes):
+    inputs = keras.Input(shape=input_shape)
+
+    # Entry block
+    x = layers.Rescaling(1.0 / 255)(inputs)
+    x = layers.Conv2D(128, 3, strides=2, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    previous_block_activation = x  # Set aside residual
+
+    for size in [256, 512, 728]:
+        x = layers.Activation("relu")(x)
+        x = layers.SeparableConv2D(size, 3, padding="same")(x)
+        x = layers.BatchNormalization()(x)
+
+        x = layers.Activation("relu")(x)
+        x = layers.SeparableConv2D(size, 3, padding="same")(x)
+        x = layers.BatchNormalization()(x)
+
+        x = layers.MaxPooling2D(3, strides=2, padding="same")(x)
+
+        # Project residual
+        residual = layers.Conv2D(size, 1, strides=2, padding="same")(
+            previous_block_activation
+        )
+        x = layers.add([x, residual])  # Add back residual
+        previous_block_activation = x  # Set aside next residual
+
+    x = layers.SeparableConv2D(1024, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    if num_classes == 2:
+        units = 1  # For binary classification with BinaryCrossentropy(from_logits=True)
+    else:
+        units = num_classes
+
+    x = layers.Dropout(0.25)(x)
+    # We specify activation=None so as to return logits
+    outputs = layers.Dense(units, activation=None)(x)
+    return keras.Model(inputs, outputs)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> keras.Model:
+    """
+    Builds and returns the Keras model.
+
+    Args:
+        config: A dictionary containing configuration parameters for the model.
+                Expected keys: 'image_size', 'num_classes'.
+
+    Returns:
+        A Keras Model instance.
+    """
+    image_size = config.get("image_size", (180, 180))
+    num_classes = config.get("num_classes", 2)  # Cats vs Dogs is a binary classification
+    input_shape = image_size + (3,)  # Assuming RGB images
+
+    return make_model(input_shape=input_shape, num_classes=num_classes)
+
+
+def build_dataloader(config: dict, split: str = "train") -> tf_data.Dataset:
+    """
+    Builds and returns a TensorFlow `tf.data.Dataset` for the specified split.
+
+    Args:
+        config: A dictionary containing configuration parameters for the dataset.
+                Expected keys: 'data_path', 'image_size', 'batch_size', 'seed',
+                'validation_split'.
+        split: A string indicating the dataset split to build ("train" or "val").
+
+    Returns:
+        A tf.data.Dataset instance.
+    """
+    data_path = config.get("data_path", "PetImages")
+    image_size = config.get("image_size", (180, 180))
+    batch_size = config.get("batch_size", 128)
+    seed = config.get("seed", 1337)
+    validation_split = config.get("validation_split", 0.2)
+
+    # Note: The original script includes code for filtering corrupted images
+    # from the PetImages directory. In an FL setting, it is typically assumed
+    # that such data preprocessing and cleaning steps are performed once
+    # during initial dataset setup, before clients begin training.
+    # This function assumes the `data_path` contains a clean, preprocessed
+    # dataset or relies on `image_dataset_from_directory` to handle non-image files.
+
+    subset_str = "training" if split == "train" else "validation"
+
+    ds = keras.utils.image_dataset_from_directory(
+        data_path,
+        validation_split=validation_split,
+        subset=subset_str,
+        seed=seed,
+        image_size=image_size,
+        batch_size=batch_size,
+    )
+
+    if split == "train":
+        # Apply data augmentation only to the training images
+        ds = ds.map(
+            lambda img, label: (data_augmentation(img), label),
+            num_parallel_calls=tf_data.AUTOTUNE,
+        )
+
+    # Prefetching samples in memory helps maximize GPU/CPU utilization.
+    ds = ds.prefetch(tf_data.AUTOTUNE)
+    return ds
+
+
+def train_step(
+    model: keras.Model,
+    batch: tuple | list,
+    optimizer,  # Included as per exemplar, but not used within this function
+    config: dict,
+) -> tf.Tensor:
+    """
+    Performs ONE forward pass and returns the raw loss tensor (with grad_fn).
+
+    CONTRACT (read carefully):
+      - This function performs ONE forward pass and returns the raw loss tensor.
+      - The returned tensor MUST have grad_fn attached (do NOT call .numpy()).
+      - Do NOT call GradientTape.gradient() or optimizer.apply_gradients()
+        or optimizer.zero_grad() inside train_step.
+      - Do NOT call .numpy() on the returned loss.
+      The FL runtime owns gradient computation, weight updates, and metric extraction.
+
+    Args:
+        model: The Keras model to train.
+        batch: A tuple/list containing (inputs, targets) for the current batch.
+        optimizer: The optimizer instance (not used directly in this Keras client's
+                   train_step due to contract, but kept for signature consistency).
+        config: A dictionary containing configuration parameters for training.
+
+    Returns:
+        A TensorFlow Tensor representing the raw loss for the batch.
+    """
+    inputs, targets = batch[0], batch[1]
+
+    # The Keras model's call method handles device placement automatically.
+    # `training=True` is crucial for layers like BatchNormalization and Dropout
+    # to behave correctly during the training phase.
+    outputs = model(inputs, training=True)
+
+    # The original script used BinaryCrossentropy with from_logits=True
+    # for binary classification.
+    loss_fn = keras.losses.BinaryCrossentropy(from_logits=True)
+    loss = loss_fn(targets, outputs)
+
+    # The returned loss tensor will have gradient information attached
+    # if this train_step is invoked within a tf.GradientTape context
+    # by the FL runtime.
+    return loss
+```

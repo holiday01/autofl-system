@@ -1,0 +1,174 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: siamese_network training script (MNIST APP_MATCHER)
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+from __future__ import print_function
+import random
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torchvision
+from torchvision import datasets
+from torch.utils.data import Dataset, DataLoader, random_split
+
+
+class SiameseNetwork(nn.Module):
+    def __init__(self):
+        super(SiameseNetwork, self).__init__()
+        self.resnet = torchvision.models.resnet18(weights=None)
+        self.resnet.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        self.fc_in_features = self.resnet.fc.in_features
+        self.resnet = torch.nn.Sequential(*(list(self.resnet.children())[:-1]))
+        self.fc = nn.Sequential(
+            nn.Linear(self.fc_in_features * 2, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 1),
+        )
+        self.sigmoid = nn.Sigmoid()
+        self.resnet.apply(self.init_weights)
+        self.fc.apply(self.init_weights)
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            m.bias.data.fill_(0.01)
+
+    def forward_once(self, x):
+        output = self.resnet(x)
+        output = output.view(output.size()[0], -1)
+        return output
+
+    def forward(self, input1, input2):
+        output1 = self.forward_once(input1)
+        output2 = self.forward_once(input2)
+        output = torch.cat((output1, output2), 1)
+        output = self.fc(output)
+        output = self.sigmoid(output)
+        return output
+
+
+class APP_MATCHER(Dataset):
+    def __init__(self, root, train, download=False):
+        super(APP_MATCHER, self).__init__()
+        self.dataset = datasets.MNIST(root, train=train, download=download)
+        self.data = self.dataset.data.unsqueeze(1).clone()
+        self.group_examples()
+
+    def group_examples(self):
+        np_arr = np.array(self.dataset.targets.clone(), dtype=None, copy=None)
+        self.grouped_examples = {}
+        for i in range(0, 10):
+            self.grouped_examples[i] = np.where((np_arr == i))[0]
+
+    def __len__(self):
+        return self.data.shape[0]
+
+    def __getitem__(self, index):
+        selected_class = random.randint(0, 9)
+        random_index_1 = random.randint(0, self.grouped_examples[selected_class].shape[0] - 1)
+        index_1 = self.grouped_examples[selected_class][random_index_1]
+        image_1 = self.data[index_1].clone().float()
+
+        if index % 2 == 0:
+            random_index_2 = random.randint(0, self.grouped_examples[selected_class].shape[0] - 1)
+            while random_index_2 == random_index_1:
+                random_index_2 = random.randint(0, self.grouped_examples[selected_class].shape[0] - 1)
+            index_2 = self.grouped_examples[selected_class][random_index_2]
+            image_2 = self.data[index_2].clone().float()
+            target = torch.tensor(1, dtype=torch.float)
+        else:
+            other_selected_class = random.randint(0, 9)
+            while other_selected_class == selected_class:
+                other_selected_class = random.randint(0, 9)
+            random_index_2 = random.randint(0, self.grouped_examples[other_selected_class].shape[0] - 1)
+            index_2 = self.grouped_examples[other_selected_class][random_index_2]
+            image_2 = self.data[index_2].clone().float()
+            target = torch.tensor(0, dtype=torch.float)
+
+        return image_1, image_2, target
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    return SiameseNetwork()
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 64))
+    num_workers = local.get("num_workers", config.get("num_workers", 1))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", "../data")
+    download   = config.get("download", True)
+    is_train   = (split == "train")
+
+    full_dataset = APP_MATCHER(root=data_path, train=is_train, download=download)
+
+    if is_train:
+        val_ratio = config.get("val_ratio", 0.1)
+        n_val = max(1, int(len(full_dataset) * val_ratio))
+        n_train = len(full_dataset) - n_val
+        train_ds, _ = random_split(
+            full_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(config.get("seed", 42)),
+        )
+        ds = train_ds
+    else:
+        ds = full_dataset
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=is_train,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+
+    Expects batch = (images_1, images_2, targets) as produced by APP_MATCHER.
+    """
+    device = next(model.parameters()).device
+
+    if not isinstance(batch, (list, tuple)) or len(batch) != 3:
+        raise TypeError(
+            f"Expected batch to be a 3-tuple (images_1, images_2, targets), got {type(batch)}"
+        )
+
+    images_1, images_2, targets = batch
+    images_1 = images_1.to(device)
+    images_2 = images_2.to(device)
+    targets  = targets.to(device)
+
+    outputs = model(images_1, images_2).squeeze()
+    criterion = nn.BCELoss()
+    loss = criterion(outputs, targets)
+    return loss
+```

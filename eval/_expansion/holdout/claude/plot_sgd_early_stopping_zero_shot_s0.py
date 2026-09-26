@@ -1,0 +1,82 @@
+import numpy as np
+from sklearn import linear_model
+from sklearn.datasets import fetch_openml
+from sklearn.model_selection import train_test_split
+from sklearn.utils import shuffle
+
+
+def build_model(config):
+    stopping = config.get("stopping", "validation")
+    if stopping == "none":
+        model = linear_model.SGDClassifier(
+            n_iter_no_change=config.get("n_iter_no_change", 3),
+            max_iter=config.get("max_iter", 50),
+            random_state=config.get("random_state", 0),
+        )
+    elif stopping == "training_loss":
+        model = linear_model.SGDClassifier(
+            early_stopping=False,
+            n_iter_no_change=config.get("n_iter_no_change", 3),
+            tol=config.get("tol", 0.1),
+            max_iter=config.get("max_iter", 50),
+            random_state=config.get("random_state", 0),
+        )
+    else:
+        model = linear_model.SGDClassifier(
+            early_stopping=True,
+            n_iter_no_change=config.get("n_iter_no_change", 3),
+            tol=config.get("tol", 0.0001),
+            validation_fraction=config.get("validation_fraction", 0.2),
+            max_iter=config.get("max_iter", 50),
+            random_state=config.get("random_state", 0),
+        )
+    return model
+
+
+def build_dataloader(config, split):
+    class_0 = config.get("class_0", "0")
+    class_1 = config.get("class_1", "8")
+    n_samples = config.get("n_samples", 10000)
+    test_size = config.get("test_size", 0.5)
+    random_state = config.get("random_state", 0)
+
+    mnist = fetch_openml("mnist_784", version=1, as_frame=False)
+    mask = np.logical_or(
+        mnist.target.astype(str) == str(class_0),
+        mnist.target.astype(str) == str(class_1),
+    )
+    X, y = shuffle(mnist.data[mask], mnist.target[mask], random_state=42)
+    if n_samples is not None:
+        X, y = X[:n_samples], y[:n_samples]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state
+    )
+
+    if split == "train":
+        return X_train, y_train
+    elif split == "test":
+        return X_test, y_test
+    else:
+        raise ValueError(f"Unknown split: {split!r}. Expected 'train' or 'test'.")
+
+
+def train_step(model, batch, optimizer, config):
+    X_batch, y_batch = batch
+    classes = config.get("classes", None)
+
+    if classes is not None:
+        model.partial_fit(X_batch, y_batch, classes=classes)
+    else:
+        model.partial_fit(X_batch, y_batch)
+
+    loss = None
+    if hasattr(model, "loss_function_"):
+        try:
+            loss = model.loss_function_(
+                model.decision_function(X_batch), y_batch
+            ).mean()
+        except Exception:
+            pass
+
+    return {"loss": loss, "n_iter": getattr(model, "n_iter_", None)}

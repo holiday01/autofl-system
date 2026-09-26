@@ -1,0 +1,300 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: pytorch/examples/dcgan/main.py
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+from __future__ import print_function
+import os
+import random
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+# import torchvision.utils as vutils # Not directly used in FL client training step
+
+# --- Model Definitions (Copied/Adapted from Original Script) ---
+
+# custom weights initialization called on netG and netD
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        torch.nn.init.normal_(m.weight, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        torch.nn.init.normal_(m.weight, 1.0, 0.02)
+        torch.nn.init.zeros_(m.bias)
+
+
+class Generator(nn.Module):
+    def __init__(self, ngpu=1, nz=100, ngf=64, nc=3):
+        super(Generator, self).__init__()
+        self.ngpu = ngpu
+        self.main = nn.Sequential(
+            # input is Z, going into a convolution
+            nn.ConvTranspose2d(     nz, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            # state size. (ngf*8) x 4 x 4
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            # state size. (ngf*4) x 8 x 8
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+            # state size. (ngf*2) x 16 x 16
+            nn.ConvTranspose2d(ngf * 2,     ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            # state size. (ngf) x 32 x 32
+            nn.ConvTranspose2d(    ngf,      nc, 4, 2, 1, bias=False),
+            nn.Tanh()
+            # state size. (nc) x 64 x 64
+        )
+        self.apply(weights_init)
+
+    def forward(self, input):
+        # In an FL client, multi-GPU parallelism is typically managed by the FL runtime.
+        # This original logic is preserved for fidelity if a client setup somehow uses it.
+        if (input.is_cuda or (hasattr(input, 'is_xpu') and input.is_xpu)) and self.ngpu > 1:
+            output = nn.parallel.data_parallel(self.main, input, list(range(self.ngpu)))
+        else:
+            output = self.main(input)
+        return output
+
+
+class Discriminator(nn.Module):
+    def __init__(self, ngpu=1, ndf=64, nc=3):
+        super(Discriminator, self).__init__()
+        self.ngpu = ngpu
+        self.main = nn.Sequential(
+            # input is (nc) x 64 x 64
+            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf) x 32 x 32
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*2) x 16 x 16
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*4) x 8 x 8
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (ndf*8) x 4 x 4
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+        self.apply(weights_init)
+
+    def forward(self, input):
+        if (input.is_cuda or (hasattr(input, 'is_xpu') and input.is_xpu)) and self.ngpu > 1:
+            output = nn.parallel.data_parallel(self.main, input, list(range(self.ngpu)))
+        else:
+            output = self.main(input)
+        return output.view(-1, 1).squeeze(1)
+
+
+# Wrapper for both G and D to comply with `build_model -> nn.Module`
+class GANClientWrapper(nn.Module):
+    def __init__(self, ngpu=1, nz=100, ngf=64, ndf=64, nc=3):
+        super().__init__()
+        self.generator = Generator(ngpu, nz, ngf, nc)
+        self.discriminator = Discriminator(ngpu, ndf, nc)
+
+    def forward(self, input):
+        # The forward method of this wrapper is not directly used in `train_step`
+        # as `train_step` accesses `self.generator` and `self.discriminator` directly.
+        # However, an `nn.Module` must have a forward method.
+        raise NotImplementedError(
+            "GANClientWrapper's forward method is not intended for direct use in this FL client. "
+            "Individual generator/discriminator methods are accessed by train_step."
+        )
+
+
+# --- FL Interface ---
+
+def _get_nc_from_dataset_name(dataset_name: str) -> int:
+    """Helper to determine number of channels based on dataset name."""
+    if dataset_name in ['imagenet', 'folder', 'lfw', 'lsun', 'cifar10', 'fake']:
+        return 3
+    elif dataset_name == 'mnist':
+        return 1
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    # Default values from the original script's argparse
+    ngpu = kwargs.get("ngpu", config.get("ngpu", 1))
+    nz = kwargs.get("nz", config.get("nz", 100))
+    ngf = kwargs.get("ngf", config.get("ngf", 64))
+    ndf = kwargs.get("ndf", config.get("ndf", 64))
+
+    dataset_name = config.get("dataset", "fake")
+    nc = _get_nc_from_dataset_name(dataset_name)
+
+    return GANClientWrapper(ngpu=ngpu, nz=nz, ngf=ngf, ndf=ndf, nc=nc)
+
+
+def build_dataloader(config: dict, split: str = "train") -> torch.utils.data.DataLoader:
+    local_config = config.get("local", {})
+    batch_size = local_config.get("batch_size", config.get("batch_size", 64))
+    num_workers = local_config.get("num_workers", config.get("workers", 2)) # Original used 'workers'
+    pin_memory = local_config.get("pin_memory", True)
+    image_size = config.get("image_size", config.get("imageSize", 64)) # Original used 'imageSize'
+    dataroot = config.get("dataroot", ".")
+    dataset_name = config.get("dataset", "fake")
+    manual_seed = config.get("seed", config.get("manualSeed", random.randint(1, 10000)))
+    lsun_classes_str = config.get("lsun_classes", config.get("classes", 'bedroom'))
+    lsun_classes = [c.strip() for c in lsun_classes_str.split(',')]
+
+    random.seed(manual_seed)
+    torch.manual_seed(manual_seed)
+
+    nc = _get_nc_from_dataset_name(dataset_name)
+
+    # Common transforms
+    transform_list = [
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ]
+    if dataset_name not in ['mnist']: # CenterCrop is usually good for square images if not MNIST
+        transform_list.insert(1, transforms.CenterCrop(image_size))
+
+    if nc == 3: # RGB images
+        transform_list.append(transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)))
+    elif nc == 1: # Grayscale images (MNIST)
+        transform_list.append(transforms.Normalize((0.5,), (0.5,)))
+    transform = transforms.Compose(transform_list)
+
+    dataset = None
+    if dataset_name in ['imagenet', 'folder', 'lfw']:
+        dataset = dset.ImageFolder(root=dataroot, transform=transform)
+    elif dataset_name == 'lsun':
+        classes = [c + '_train' for c in lsun_classes]
+        dataset = dset.LSUN(root=dataroot, classes=classes, transform=transform)
+    elif dataset_name == 'cifar10':
+        dataset = dset.CIFAR10(root=dataroot, download=True, transform=transform)
+    elif dataset_name == 'mnist':
+        dataset = dset.MNIST(root=dataroot, download=True, transform=transform)
+    elif dataset_name == 'fake':
+        dataset = dset.FakeData(image_size=(nc, image_size, image_size), transform=transforms.ToTensor())
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+    if dataset is None:
+        raise ValueError(f"Dataset '{dataset_name}' could not be loaded. Check 'dataroot' or dataset name.")
+
+    # The original script does not have an explicit train/val split.
+    # Following the example, we'll implement a simple random split.
+    val_ratio = config.get("val_ratio", 0.1)
+    if val_ratio > 0 and split != "full": # "full" split means no random_split
+        n_val = max(1, int(len(dataset) * val_ratio))
+        n_train = len(dataset) - n_val
+        # Ensure consistent split across clients/rounds if seed is fixed
+        generator = torch.Generator().manual_seed(manual_seed)
+        train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val], generator=generator)
+        ds = train_ds if split == "train" else val_ds
+    else:
+        ds = dataset # If val_ratio is 0 or split is "full", use the whole dataset
+
+    return torch.utils.data.DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module, # This is our GANClientWrapper
+    batch: tuple | list,
+    optimizer, # Not used for step/zero_grad, but its parameters are relevant to FL runtime
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass to calculate a loss. This client module is configured
+    to train the DISCRIMINATOR component of the GAN, following the contract
+    for a single model and a single loss return. The Generator is used
+    to produce fake samples for the Discriminator training, but its parameters
+    are not updated in this `train_step`. This design adheres to the
+    single `nn.Module` return from `build_model` and the single loss return
+    from `train_step`.
+    """
+    device = next(model.parameters()).device # Get device from model
+    
+    # Extract Generator and Discriminator from the wrapper model
+    if not isinstance(model, GANClientWrapper):
+        raise TypeError("Expected GANClientWrapper model for GAN training step.")
+    netG = model.generator
+    netD = model.discriminator
+
+    # Ensure models are on the correct device for operations
+    netG.to(device)
+    netD.to(device)
+
+    # Parameters from config (or model_kwargs)
+    batch_size = batch[0].size(0)
+    real_label = config.get("real_label", 1)
+    fake_label = config.get("fake_label", 0)
+    nz = config.get("nz", config.get("model_kwargs", {}).get("nz", 100)) # Latent vector size
+    nc = _get_nc_from_dataset_name(config.get("dataset", "fake")) # Num channels
+
+    criterion = nn.BCELoss() # Binary Cross Entropy Loss for GAN
+
+    # Move real images to device
+    real_cpu = batch[0].to(device)
+    
+    # 1. Train Discriminator with real data
+    # Create labels for real data (all ones)
+    label_real = torch.full((batch_size,), real_label,
+                           dtype=real_cpu.dtype, device=device)
+    output_real = netD(real_cpu)
+    errD_real = criterion(output_real, label_real)
+    
+    # 2. Train Discriminator with fake data
+    # Generate noise and fake images
+    noise = torch.randn(batch_size, nz, 1, 1, device=device)
+    fake = netG(noise) # Use the Generator from the wrapper
+    
+    # Create labels for fake data (all zeros)
+    label_fake = torch.full((batch_size,), fake_label,
+                           dtype=real_cpu.dtype, device=device)
+    
+    # Detach fake here to avoid computing gradients for Generator when training Discriminator
+    output_fake = netD(fake.detach()) 
+    errD_fake = criterion(output_fake, label_fake)
+    
+    # Combine Discriminator losses.
+    # The FL runtime will call .backward() on this combined loss.
+    # Since `fake` was detached, only `netD` parameters will receive gradients
+    # and will be updated by the FL runtime's optimizer.step().
+    errD = errD_real + errD_fake
+    
+    # Note: This train_step only updates the Discriminator.
+    # To update the Generator, a separate train_step (or a different FL paradigm)
+    # would be required, as it involves a different objective and optimizer.
+    
+    return errD
+```

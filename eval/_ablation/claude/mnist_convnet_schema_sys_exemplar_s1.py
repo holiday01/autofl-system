@@ -1,0 +1,185 @@
+"""
+Auto-generated FL client module.
+Original script: Simple MNIST convnet (Keras/TensorFlow → PyTorch conversion)
+
+Exposes:
+  build_model(config)                       -> nn.Module
+  build_dataloader(config, split)           -> DataLoader
+  train_step(model, batch, opt, config)     -> loss tensor (with grad_fn)
+
+CONTRACT:
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+
+Keras → PyTorch notes:
+  - keras.Sequential convnet converted to an equivalent torch.nn.Module.
+  - Input layout flipped from (B, H, W, C) [channels-last] to
+    (B, C, H, W) [channels-first] as required by nn.Conv2d.
+  - Softmax removed from the final layer; nn.CrossEntropyLoss applies
+    log-softmax internally, matching Keras categorical_crossentropy.
+  - Integer class labels are used (CrossEntropyLoss) instead of
+    one-hot vectors (as in the original Keras script).
+"""
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
+
+
+# ── Model ────────────────────────────────────────────────────────────────────
+# Architecture preserved exactly from the original Keras Sequential model:
+#   Conv2d(1→32, 3×3, relu) → MaxPool2d(2×2) →
+#   Conv2d(32→64, 3×3, relu) → MaxPool2d(2×2) →
+#   Flatten → Dropout(0.5) → Linear(1600, num_classes)
+#
+# Spatial size trace (28×28 input, no padding):
+#   Conv(3×3) → 26×26  |  MaxPool(2) → 13×13
+#   Conv(3×3) → 11×11  |  MaxPool(2) →  5×5
+#   Flatten: 64 × 5 × 5 = 1600
+
+class MNISTConvNet(nn.Module):
+    def __init__(self, num_classes: int = 10, dropout: float = 0.5):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3),    # (B, 1, 28, 28) → (B, 32, 26, 26)
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),         # (B, 32, 26, 26) → (B, 32, 13, 13)
+            nn.Conv2d(32, 64, kernel_size=3),   # (B, 32, 13, 13) → (B, 64, 11, 11)
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),         # (B, 64, 11, 11) → (B, 64,  5,  5)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=dropout),
+            nn.Linear(64 * 5 * 5, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(x))
+
+
+# ── Dataset helpers ──────────────────────────────────────────────────────────
+
+def _try_load_mnist_torchvision(root: str):
+    """
+    Attempt to load the MNIST training split from disk via torchvision.
+    Returns the Dataset on success, or None if torchvision is unavailable
+    or the data files are missing (download=False — no silent auto-download).
+    """
+    try:
+        from torchvision import datasets, transforms
+        transform = transforms.Compose([
+            transforms.ToTensor(),   # uint8 [0,255] → float32 [0,1], adds C dim
+        ])
+        ds = datasets.MNIST(
+            root=root,
+            train=True,
+            download=False,
+            transform=transform,
+        )
+        # Trigger a real file access to confirm data exists on disk
+        _ = ds[0]
+        return ds
+    except Exception:
+        return None
+
+
+# ── FL Interface ─────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return MNISTConvNet(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local       = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 16))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+    data_path   = config.get("data_path", ".")
+    val_ratio   = config.get("val_ratio", 0.1)
+    seed        = config.get("seed", 42)
+
+    full_dataset = _try_load_mnist_torchvision(data_path)
+
+    if full_dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"MNIST data not found at '{data_path}' and "
+                "`allow_synthetic_data` is False. "
+                "Provide a directory containing the MNIST binary files "
+                "(e.g. train-images-idx3-ubyte) readable by torchvision, "
+                "or set config['allow_synthetic_data'] = True to allow "
+                "synthetic data for smoke-testing only."
+            )
+        # Synthetic fallback: 1 000 random channel-first 1×28×28 images
+        n_syn        = config.get("synthetic_n", 1000)
+        X_syn        = torch.randn(n_syn, 1, 28, 28)
+        y_syn        = torch.randint(0, 10, (n_syn,))
+        full_dataset = TensorDataset(X_syn, y_syn)
+
+    n_val   = max(1, int(len(full_dataset) * val_ratio))
+    n_train = len(full_dataset) - n_val
+    train_ds, val_ds = random_split(
+        full_dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    ds = train_ds if split == "train" else val_ds
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        batch   = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        inputs  = batch[0]
+        targets = batch[1]
+    elif isinstance(batch, dict):
+        batch   = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                   for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x", batch.get("image")))
+        targets = batch.get("label", batch.get("y", batch.get("target")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    # Guard: ensure float32 channels-first input in [0, 1]
+    # (handles raw uint8 tensors that bypass the torchvision transform)
+    if inputs.dtype != torch.float32:
+        inputs = inputs.float() / 255.0
+    if inputs.ndim == 3:          # (B, H, W) → (B, 1, H, W)
+        inputs = inputs.unsqueeze(1)
+
+    # Ensure integer targets for nn.CrossEntropyLoss
+    # (guards against one-hot labels forwarded from legacy code)
+    if targets.ndim == 2:
+        targets = targets.argmax(dim=1)
+    targets = targets.long()
+
+    outputs   = model(inputs)
+    criterion = nn.CrossEntropyLoss()
+    loss      = criterion(outputs, targets)
+    return loss

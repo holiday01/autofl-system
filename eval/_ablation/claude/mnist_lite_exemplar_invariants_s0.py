@@ -1,0 +1,189 @@
+"""
+Auto-generated FL client module.
+Original script: generative_adversarial_net.py
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs GAN forward passes and returns a combined loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach() on the loss).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+
+  GAN note: fake_imgs.detach() is used internally only to prevent generator
+  gradients from contaminating the discriminator loss term — standard GAN
+  practice. The *returned* combined loss is never detached.
+"""
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+
+class Generator(nn.Module):
+    def __init__(self, latent_dim: int = 100, img_shape: tuple = (1, 28, 28)):
+        super().__init__()
+        self.img_shape = img_shape
+
+        def block(in_feat, out_feat, normalize=True):
+            layers = [nn.Linear(in_feat, out_feat)]
+            if normalize:
+                layers.append(nn.BatchNorm1d(out_feat, 0.8))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *block(latent_dim, 128, normalize=False),
+            *block(128, 256),
+            *block(256, 512),
+            *block(512, 1024),
+            nn.Linear(1024, int(math.prod(img_shape))),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        img = self.model(z)
+        return img.view(img.size(0), *self.img_shape)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, img_shape: tuple = (1, 28, 28)):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(int(math.prod(img_shape)), 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 1),
+        )
+
+    def forward(self, img):
+        img_flat = img.view(img.size(0), -1)
+        return self.model(img_flat)
+
+
+class GANWrapper(nn.Module):
+    """Wraps Generator and Discriminator into a single nn.Module for FL aggregation."""
+
+    def __init__(self, latent_dim: int = 100, img_shape: tuple = (1, 28, 28)):
+        super().__init__()
+        self.generator = Generator(latent_dim=latent_dim, img_shape=img_shape)
+        self.discriminator = Discriminator(img_shape=img_shape)
+        self.latent_dim = latent_dim
+        self.img_shape = img_shape
+
+    def forward(self, z):
+        return self.generator(z)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    latent_dim = config.get("latent_dim", 100)
+    img_shape = tuple(config.get("img_shape", [1, 28, 28]))
+    return GANWrapper(latent_dim=latent_dim, img_shape=img_shape)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 64))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory  = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", "./data")
+    img_shape = tuple(config.get("img_shape", [1, 28, 28]))
+
+    dataset = None
+    try:
+        from torchvision import datasets, transforms
+
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)),
+        ])
+        dataset = datasets.MNIST(
+            root=data_path,
+            train=(split == "train"),
+            download=False,
+            transform=transform,
+        )
+    except Exception:
+        pass
+
+    if dataset is None:
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"MNIST data not found at '{data_path}' and allow_synthetic_data is False."
+            )
+        n = config.get("synthetic_n", 1000)
+        X = torch.randn(n, *img_shape)
+        y = torch.randint(0, 10, (n,))
+        full = TensorDataset(X, y)
+        val_ratio = config.get("val_ratio", 0.1)
+        n_val = max(1, int(n * val_ratio))
+        n_train = n - n_val
+        train_ds, val_ds = random_split(
+            full,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(config.get("seed", 42)),
+        )
+        dataset = train_ds if split == "train" else val_ds
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+        drop_last=True,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    GAN forward passes.  Returns combined generator + discriminator loss WITH grad_fn.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        imgs = batch[0].to(device) if isinstance(batch[0], torch.Tensor) else batch[0]
+    elif isinstance(batch, dict):
+        imgs = batch.get("image", batch.get("x", batch.get("input"))).to(device)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    batch_size = imgs.size(0)
+    latent_dim = getattr(model, "latent_dim", config.get("latent_dim", 100))
+
+    z = torch.randn(batch_size, latent_dim, device=device)
+    fake_imgs = model.generator(z)
+
+    valid = torch.ones(batch_size, 1, device=device)
+
+    # Generator loss: fool discriminator into labelling fake images as real
+    g_loss = F.binary_cross_entropy_with_logits(model.discriminator(fake_imgs), valid)
+
+    # Discriminator loss: distinguish real from fake
+    real_loss = F.binary_cross_entropy_with_logits(model.discriminator(imgs), valid)
+    fake_labels = torch.zeros(batch_size, 1, device=device)
+    # detach fake_imgs so discriminator update does not flow gradients back through generator
+    fake_loss = F.binary_cross_entropy_with_logits(
+        model.discriminator(fake_imgs.detach()), fake_labels
+    )
+    d_loss = (real_loss + fake_loss) / 2
+
+    return g_loss + d_loss

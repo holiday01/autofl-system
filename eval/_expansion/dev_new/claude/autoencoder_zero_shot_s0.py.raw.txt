@@ -1,0 +1,58 @@
+```python
+from os import path
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms
+from lightning.pytorch.demos.mnist_datamodule import MNIST
+
+DATASETS_PATH = path.join(path.dirname(__file__), "..", "..", "Datasets")
+
+
+def build_model(config):
+    hidden_dim = config.get("hidden_dim", 64)
+
+    class AutoEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Sequential(
+                nn.Linear(28 * 28, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 3)
+            )
+            self.decoder = nn.Sequential(
+                nn.Linear(3, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 28 * 28)
+            )
+
+        def forward(self, x):
+            return self.decoder(self.encoder(x))
+
+    return AutoEncoder()
+
+
+def build_dataloader(config, split):
+    batch_size = config.get("batch_size", 32)
+    dataset = MNIST(DATASETS_PATH, train=True, download=True, transform=transforms.ToTensor())
+    train_set, val_set = random_split(
+        dataset, [55000, 5000], generator=torch.Generator().manual_seed(42)
+    )
+    test_set = MNIST(DATASETS_PATH, train=False, download=True, transform=transforms.ToTensor())
+
+    splits = {"train": train_set, "val": val_set, "test": test_set}
+    if split not in splits:
+        raise ValueError(f"split must be one of {list(splits)}, got '{split}'")
+
+    return DataLoader(splits[split], batch_size=batch_size)
+
+
+def train_step(model, batch, optimizer, config):
+    x, _ = batch
+    x = x.view(x.size(0), -1)
+
+    optimizer.zero_grad()
+    loss = F.mse_loss(x, model(x))
+    loss.backward()
+    optimizer.step()
+
+    return loss
+```

@@ -1,0 +1,159 @@
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split, TensorDataset
+
+# ---------------------------------------------------------------------------
+# Preserved architecture — PyTorch equivalent of fchollet's Keras MNIST convnet
+#
+# Input layout change: Keras uses NHWC (28, 28, 1); PyTorch uses NCHW (1, 28, 28).
+# Flatten size: 1×28×28 → Conv(32,3)→26×26 → Pool(2)→13×13
+#                        → Conv(64,3)→11×11 → Pool(2)→5×5 → 64*5*5 = 1600
+# ---------------------------------------------------------------------------
+
+class MNISTConvNet(nn.Module):
+    """PyTorch equivalent of the Keras MNIST convnet (fchollet, 2015)."""
+
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.conv1    = nn.Conv2d(1,  32, kernel_size=3)   # relu applied in forward
+        self.pool1    = nn.MaxPool2d(2)
+        self.conv2    = nn.Conv2d(32, 64, kernel_size=3)   # relu applied in forward
+        self.pool2    = nn.MaxPool2d(2)
+        self.flatten  = nn.Flatten()
+        self.dropout  = nn.Dropout(0.5)
+        self.fc       = nn.Linear(64 * 5 * 5, num_classes) # raw logits; no softmax here
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+        x = self.flatten(x)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x  # CrossEntropyLoss / NLLLoss consume raw logits
+
+
+# ---------------------------------------------------------------------------
+# FL API — three required entry-points
+# ---------------------------------------------------------------------------
+
+def build_model(config: dict) -> nn.Module:
+    """Instantiate and return the MNISTConvNet.
+
+    Recognised config keys
+    ----------------------
+    model_kwargs : dict  — passed as **kwargs to MNISTConvNet (e.g. num_classes).
+    """
+    kwargs = config.get("model_kwargs", {})
+    return MNISTConvNet(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """Return a DataLoader for 'train' or 'val'.
+
+    Recognised config keys
+    ----------------------
+    local.batch_size      : int   — default 16.
+    data_path             : str   — root dir for MNIST download; default ".".
+    allow_synthetic_data  : bool  — must be True to fall back to random tensors.
+
+    The full training set is split 90 / 10 (train / val) using random_split with
+    a fixed seed so every client partitions identically.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path  = config.get("data_path", ".")
+
+    # ── real data via torchvision ──────────────────────────────────────────
+    try:
+        from torchvision import datasets, transforms
+
+        transform = transforms.Compose([
+            transforms.ToTensor(),          # scales uint8 [0,255] → float [0,1]
+                                            # and adds the channel dim → (1,28,28)
+        ])
+
+        full_dataset = datasets.MNIST(
+            root=data_path,
+            train=True,
+            download=True,
+            transform=transform,
+        )
+
+        val_size   = int(0.1 * len(full_dataset))
+        train_size = len(full_dataset) - val_size
+        train_ds, val_ds = random_split(
+            full_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        chosen = train_ds if split == "train" else val_ds
+
+    except Exception as exc:
+        # ── synthetic fallback (explicit opt-in required) ──────────────────
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Real MNIST data could not be loaded from data_path='{data_path}'. "
+                "Either supply the dataset or set allow_synthetic_data=True in the "
+                "config to permit training on random tensors."
+            ) from exc
+
+        n_total    = 500
+        x_syn      = torch.randn(n_total, 1, 28, 28)
+        y_syn      = torch.randint(0, 10, (n_total,))
+        full_syn   = TensorDataset(x_syn, y_syn)
+        val_size   = max(1, int(0.1 * n_total))
+        train_size = n_total - val_size
+        train_ds, val_ds = random_split(
+            full_syn,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        chosen = train_ds if split == "train" else val_ds
+
+    return DataLoader(
+        chosen,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        drop_last=(split == "train"),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer,          # present for API compatibility; NOT called here
+    config: dict,
+) -> torch.Tensor:
+    """Run ONE forward pass and return the loss tensor (grad_fn intact).
+
+    The FL runtime is responsible for loss.backward() and optimizer.step().
+    Moving tensors to the model's device is handled here so the caller need
+    not know which device is active.
+    """
+    device = next(model.parameters()).device
+
+    images, labels = batch
+    images = images.to(device)          # (B, 1, 28, 28)  float32
+    labels = labels.to(device)          # (B,)             int64
+
+    logits = model(images)              # (B, num_classes) raw logits
+    loss   = F.cross_entropy(logits, labels)
+    # DO NOT call loss.backward() or optimizer.step() here.
+    # DO NOT detach or call .item() — the grad_fn must remain attached.
+    return loss
+```
+
+### What changed and why
+
+| Original (Keras) | FL module (PyTorch) |
+|---|---|
+| `keras.Sequential` with NHWC layout | `MNISTConvNet(nn.Module)` with NCHW `(1, 28, 28)` layout |
+| `layers.Dense(10, activation="softmax")` | `nn.Linear(1600, 10)` — raw logits; softmax is folded into `F.cross_entropy` |
+| `keras.datasets.mnist.load_data()` at module level | `torchvision.datasets.MNIST(..., download=True)` inside `build_dataloader`, isolated behind a try/except |
+| `model.fit(…, validation_split=0.1)` | `random_split(full, [90%, 10%], seed=42)` — deterministic, works for both splits |
+| `model.compile(…); model.fit(…)` | `train_step` — single forward pass only; no `.backward()`, no `.step()` |
+| Implicit global state | All config flows through the three FL entry-points |

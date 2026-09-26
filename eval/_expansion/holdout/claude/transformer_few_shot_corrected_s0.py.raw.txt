@@ -1,0 +1,103 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: lightning transformer language model (WikiText2)
+
+Exposes:
+  build_model(config)                   -> nn.Module
+  build_dataloader(config, split)       -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+
+from lightning.pytorch.demos import Transformer, WikiText2
+
+
+class TransformerLM(nn.Module):
+    """Plain nn.Module wrapper around the Lightning demo Transformer."""
+
+    def __init__(self, vocab_size: int = 33278):
+        super().__init__()
+        self.model = Transformer(vocab_size=vocab_size)
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return self.model(inputs, targets)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return TransformerLM(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size  = local.get("batch_size", config.get("batch_size", 20))
+    # WikiText2 is not fork-safe; default num_workers=0
+    num_workers = local.get("num_workers", config.get("num_workers", 0))
+    pin_memory  = local.get("pin_memory", True)
+
+    val_size  = config.get("val_size", 2000)
+    test_size = config.get("test_size", 2000)
+    seed      = config.get("seed", 42)
+
+    dataset = WikiText2()
+    n = len(dataset)
+    train_size = n - val_size - test_size
+
+    train_ds, val_ds, _ = random_split(
+        dataset,
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    ds = train_ds if split == "train" else val_ds
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch: tuple | list,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+    """
+    device = next(model.parameters()).device
+
+    if isinstance(batch, (list, tuple)):
+        inputs  = batch[0].to(device) if isinstance(batch[0], torch.Tensor) else batch[0]
+        targets = batch[1].to(device) if isinstance(batch[1], torch.Tensor) else batch[1]
+    elif isinstance(batch, dict):
+        batch   = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                   for k, v in batch.items()}
+        inputs  = batch.get("input", batch.get("x"))
+        targets = batch.get("target", batch.get("y"))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    outputs = model(inputs, targets)
+    loss = F.nll_loss(outputs, targets.view(-1))
+    return loss
+```

@@ -1,0 +1,242 @@
+import numpy as np
+import os
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model: PyTorch equivalent of the original Keras character-level seq2seq model
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Seq2SeqModel(nn.Module):
+    """
+    Character-level recurrent sequence-to-sequence model.
+    Mirrors the original Keras architecture:
+      - Encoder LSTM  → final hidden/cell state only (outputs discarded)
+      - Decoder LSTM  ← encoder states as initial state (teacher forcing)
+      - Dense + softmax output layer
+    """
+
+    def __init__(
+        self,
+        num_encoder_tokens: int,
+        num_decoder_tokens: int,
+        latent_dim: int = 256,
+    ):
+        super().__init__()
+        self.encoder_lstm = nn.LSTM(num_encoder_tokens, latent_dim, batch_first=True)
+        self.decoder_lstm = nn.LSTM(num_decoder_tokens, latent_dim, batch_first=True)
+        self.decoder_dense = nn.Linear(latent_dim, num_decoder_tokens)
+
+    def forward(
+        self,
+        encoder_input: torch.Tensor,
+        decoder_input: torch.Tensor,
+    ) -> torch.Tensor:
+        # Encoder: discard sequence outputs, keep final hidden & cell states
+        _, (h, c) = self.encoder_lstm(encoder_input)
+        # Decoder: teacher-forcing — initialise with encoder states
+        decoder_out, _ = self.decoder_lstm(decoder_input, (h, c))
+        # Project to vocabulary size and normalise  (mirrors Keras Dense + softmax)
+        logits = self.decoder_dense(decoder_out)
+        return F.softmax(logits, dim=-1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dataset
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Seq2SeqDataset(Dataset):
+    """
+    Reads fra.txt, tokenises at the character level using one-hot encoding,
+    and returns (encoder_input, decoder_input, decoder_target) float tensors
+    that exactly replicate the three NumPy arrays built in the original script.
+    """
+
+    def __init__(self, data_path: str, num_samples: int = 10000):
+        input_texts: list = []
+        target_texts: list = []
+        input_characters: set = set()
+        target_characters: set = set()
+
+        with open(data_path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+
+        for line in lines[: min(num_samples, len(lines) - 1)]:
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            input_text, target_text = parts[0], parts[1]
+            # Tab = start-of-sequence character; newline = end-of-sequence
+            target_text = "\t" + target_text + "\n"
+            input_texts.append(input_text)
+            target_texts.append(target_text)
+            input_characters.update(input_text)
+            target_characters.update(target_text)
+
+        input_characters_sorted = sorted(input_characters)
+        target_characters_sorted = sorted(target_characters)
+
+        self.num_encoder_tokens = len(input_characters_sorted)
+        self.num_decoder_tokens = len(target_characters_sorted)
+        self.max_encoder_seq_length = max(len(t) for t in input_texts)
+        self.max_decoder_seq_length = max(len(t) for t in target_texts)
+
+        input_token_index = {ch: i for i, ch in enumerate(input_characters_sorted)}
+        target_token_index = {ch: i for i, ch in enumerate(target_characters_sorted)}
+
+        n = len(input_texts)
+        enc = np.zeros(
+            (n, self.max_encoder_seq_length, self.num_encoder_tokens), dtype="float32"
+        )
+        dec_in = np.zeros(
+            (n, self.max_decoder_seq_length, self.num_decoder_tokens), dtype="float32"
+        )
+        dec_tgt = np.zeros(
+            (n, self.max_decoder_seq_length, self.num_decoder_tokens), dtype="float32"
+        )
+
+        for i, (inp, tgt) in enumerate(zip(input_texts, target_texts)):
+            for t, ch in enumerate(inp):
+                enc[i, t, input_token_index[ch]] = 1.0
+            enc[i, t + 1 :, input_token_index[" "]] = 1.0
+            for t, ch in enumerate(tgt):
+                dec_in[i, t, target_token_index[ch]] = 1.0
+                if t > 0:
+                    dec_tgt[i, t - 1, target_token_index[ch]] = 1.0
+            dec_in[i, t + 1 :, target_token_index[" "]] = 1.0
+            dec_tgt[i, t :, target_token_index[" "]] = 1.0
+
+        self.encoder_input_data = torch.from_numpy(enc)
+        self.decoder_input_data = torch.from_numpy(dec_in)
+        self.decoder_target_data = torch.from_numpy(dec_tgt)
+
+    def __len__(self) -> int:
+        return self.encoder_input_data.shape[0]
+
+    def __getitem__(self, idx):
+        return (
+            self.encoder_input_data[idx],
+            self.decoder_input_data[idx],
+            self.decoder_target_data[idx],
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FL API
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Instantiate and return the seq2seq model.
+
+    Recognised config["model_kwargs"] keys
+    ----------------------------------------
+    num_encoder_tokens   int   (default 71)  – input character vocabulary size
+    num_decoder_tokens   int   (default 93)  – target character vocabulary size
+    latent_dim           int   (default 256) – LSTM hidden size
+    """
+    kwargs = config.get("model_kwargs", {})
+    return Seq2SeqModel(
+        num_encoder_tokens=kwargs.get("num_encoder_tokens", 71),
+        num_decoder_tokens=kwargs.get("num_decoder_tokens", 93),
+        latent_dim=kwargs.get("latent_dim", 256),
+    )
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    """
+    Return a DataLoader for the requested split ("train" or "val").
+
+    config keys
+    -----------
+    data_path             str   directory that contains fra.txt  (default ".")
+    local.batch_size      int   mini-batch size                  (default 16)
+    num_samples           int   rows to read from fra.txt        (default 10000)
+    allow_synthetic_data  bool  enable synthetic fallback        (default False)
+
+    If fra.txt is absent and allow_synthetic_data is False a FileNotFoundError
+    is raised.  Synthetic tensors are only ever used when the flag is True.
+    """
+    batch_size = config.get("local", {}).get("batch_size", 16)
+    data_path = config.get("data_path", ".")
+    num_samples = config.get("num_samples", 10000)
+    fra_txt = os.path.join(data_path, "fra.txt")
+
+    if not os.path.exists(fra_txt):
+        if not config.get("allow_synthetic_data", False):
+            raise FileNotFoundError(
+                f"Real data file not found at '{fra_txt}'. "
+                "Supply the correct 'data_path' in config, or set "
+                "config['allow_synthetic_data'] = True to use synthetic data."
+            )
+        # ── Synthetic fallback (active only when explicitly allowed) ──────────
+        kwargs = config.get("model_kwargs", {})
+        num_enc_tok = kwargs.get("num_encoder_tokens", 71)
+        num_dec_tok = kwargs.get("num_decoder_tokens", 93)
+        max_enc_len = kwargs.get("max_encoder_seq_length", 16)
+        max_dec_len = kwargs.get("max_decoder_seq_length", 59)
+        n = min(num_samples, 200)
+        enc = torch.randn(n, max_enc_len, num_enc_tok).abs()
+        dec_in = torch.randn(n, max_dec_len, num_dec_tok).abs()
+        dec_tgt = torch.randn(n, max_dec_len, num_dec_tok).abs()
+        dataset = torch.utils.data.TensorDataset(enc, dec_in, dec_tgt)
+    else:
+        dataset = Seq2SeqDataset(fra_txt, num_samples=num_samples)
+
+    # 80 / 20 deterministic train-val split
+    n_total = len(dataset)
+    n_val = max(1, int(0.2 * n_total))
+    n_train = n_total - n_val
+    train_ds, val_ds = random_split(
+        dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    chosen_ds = train_ds if split == "train" else val_ds
+    return DataLoader(
+        chosen_ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        drop_last=True,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+
+def train_step(
+    model: nn.Module,
+    batch,
+    optimizer,
+    config: dict,
+) -> torch.Tensor:
+    """
+    Execute ONE forward pass and return the loss tensor WITH grad attached.
+
+    Does NOT call loss.backward() or optimizer.step() — the FL runtime
+    is responsible for both.
+
+    Loss: categorical cross-entropy  −Σ y_true · log(y_pred)
+    matching the original model.compile(loss="categorical_crossentropy").
+    """
+    device = next(model.parameters()).device
+
+    encoder_input, decoder_input, decoder_target = batch
+    encoder_input = encoder_input.to(device)
+    decoder_input = decoder_input.to(device)
+    decoder_target = decoder_target.to(device)
+
+    # Single forward pass
+    output = model(encoder_input, decoder_input)  # (B, T, num_decoder_tokens)
+
+    # Categorical cross-entropy over flattened (batch * time) dimension.
+    # Clamp mirrors Keras' default epsilon (1e-7) for numerical stability.
+    output_flat = output.reshape(-1, output.size(-1))                  # (B*T, V)
+    target_flat = decoder_target.reshape(-1, decoder_target.size(-1))  # (B*T, V)
+    loss = -(target_flat * torch.log(output_flat.clamp(min=1e-7))).sum(dim=-1).mean()
+    return loss
