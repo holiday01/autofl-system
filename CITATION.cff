@@ -32,7 +32,7 @@ keywords:
   - benchmark
 license: MIT
 version: 2.0.0
-date-released: "2026-09-22"
+date-released: "2026-09-26"
 doi: "10.5281/zenodo.20156961"
 repository-code: "https://github.com/holiday01/autofl-system"
 identifiers:
