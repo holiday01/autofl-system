@@ -31,8 +31,8 @@ keywords:
   - FedAvg
   - benchmark
 license: MIT
-version: 2.0.0
-date-released: "2026-09-26"
+version: 2.0.1
+date-released: "2026-09-27"
 doi: "10.5281/zenodo.20156961"
 repository-code: "https://github.com/holiday01/autofl-system"
 identifiers:
