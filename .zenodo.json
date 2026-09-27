@@ -2,17 +2,12 @@
   "title": "AutoFL: System and Benchmark Suite",
   "upload_type": "software",
   "license": "MIT",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "creators": [
     {
       "name": "Chiu, Yen-Jung",
       "affiliation": "Department of Biomedical Engineering, Chang Gung University, Taoyuan, Taiwan",
       "orcid": "0000-0002-2087-2266"
-    },
-    {
-      "name": "Chuang, Chao-Chun",
-      "affiliation": "National Center for High-performance Computing, National Applied Research Laboratories, Taiwan",
-      "orcid": "0000-0003-2488-0578"
     }
   ],
   "description": "<p>Source code, benchmark suite, and generated client files for the paper <i>Schema-Augmented LLM Prompting for Converting ML Training Scripts to Federated Learning Clients</i> (ACM TOSEM, resubmission 2026). v2.0 corrects FedAvg to sample-count weighting, partitions the IID simulation, moves generated-module import to preflight Stage 1 in an isolated subprocess, adds a strict data mode, and versions the structured specification. It adds a rule-based template converter, a frozen 33-script expansion benchmark, runners for self-repair, prompt ablation, repeated sampling and differential tests, a consistency check against the manuscript, and a pinned Docker environment.</p>",

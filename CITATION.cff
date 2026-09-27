@@ -9,10 +9,6 @@ authors:
     given-names: Yen-Jung
     affiliation: "Department of Biomedical Engineering, Chang Gung University, Taoyuan, Taiwan"
     orcid: "https://orcid.org/0000-0002-2087-2266"
-  - family-names: Chuang
-    given-names: Chao-Chun
-    affiliation: "National Center for High-performance Computing, National Applied Research Laboratories, Taiwan"
-    orcid: "https://orcid.org/0000-0003-2488-0578"
 abstract: >-
   AutoFL converts existing machine-learning training scripts into
   federated-learning (FL) client modules. This artifact contains the AutoFL
@@ -31,7 +27,7 @@ keywords:
   - FedAvg
   - benchmark
 license: MIT
-version: 2.0.1
+version: 2.0.2
 date-released: "2026-09-27"
 doi: "10.5281/zenodo.20156961"
 repository-code: "https://github.com/holiday01/autofl-system"

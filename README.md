@@ -88,7 +88,7 @@ MIT (see `LICENSE`).
 ```bibtex
 @misc{autofl_system_2026,
   title  = {AutoFL: System and Benchmark Suite},
-  author = {Chiu, Yen-Jung and Chuang, Chao-Chun},
+  author = {Chiu, Yen-Jung},
   year   = {2026},
   doi    = {10.5281/zenodo.20156961},
   note   = {Version 2.0. v1.0: 10.5281/zenodo.20156962}
