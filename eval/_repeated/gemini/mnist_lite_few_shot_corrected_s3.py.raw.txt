@@ -1,0 +1,233 @@
+```python
+"""
+Auto-generated FL client module.
+Original script: lightning_gan_train.py
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+
+NOTE ON GANS:
+This conversion interprets the FL contract for a single model and optimizer.
+For a Generative Adversarial Network (GAN), this typically means one of two strategies:
+1.  Federate only the Generator (or Discriminator) and keep the other model local and fixed
+    or updated through a separate mechanism.
+2.  Design a custom FL framework that explicitly supports multi-model, multi-optimizer FL.
+
+This conversion implements strategy 1: `build_model` returns the Generator,
+and `train_step` calculates the Generator's adversarial loss against a locally
+instantiated and fixed Discriminator. The Discriminator is NOT updated by the
+FL runtime's optimizer.
+"""
+import math
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset, random_split
+
+
+class Generator(nn.Module):
+    def __init__(self, latent_dim: int = 100, img_shape: tuple = (1, 28, 28)):
+        super().__init__()
+        self.img_shape = img_shape
+
+        def block(in_feat, out_feat, normalize=True):
+            layers = [nn.Linear(in_feat, out_feat)]
+            if normalize:
+                layers.append(nn.BatchNorm1d(out_feat, 0.8))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *block(latent_dim, 128, normalize=False),
+            *block(128, 256),
+            *block(256, 512),
+            *block(512, 1024),
+            nn.Linear(1024, int(math.prod(img_shape))),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        img = self.model(z)
+        return img.view(img.size(0), *self.img_shape)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, img_shape: tuple = (1, 28, 28)):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(int(math.prod(img_shape)), 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 1),
+        )
+
+    def forward(self, img):
+        img_flat = img.view(img.size(0), -1)
+        return self.model(img_flat)
+
+
+# Define adversarial loss function
+def adversarial_loss(y_hat, y):
+    return F.binary_cross_entropy_with_logits(y_hat, y)
+
+
+# Global Discriminator instance for train_step.
+# This Discriminator is local to the client, is NOT part of the federated model,
+# and will NOT be updated by the FL framework's optimizer.
+# It simulates a fixed oracle or a pre-trained component.
+_global_discriminator = None
+_global_discriminator_device = None
+_global_discriminator_config_hash = None
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    """
+    Builds the Generator model for FL.
+    The Discriminator is treated as a local, fixed component (not federated).
+    """
+    latent_dim = config.get("latent_dim", 100)
+    img_shape = tuple(config.get("img_shape", (1, 28, 28)))
+    return Generator(latent_dim=latent_dim, img_shape=img_shape)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size = local.get("batch_size", config.get("batch_size", 32))
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory = local.get("pin_memory", True)
+    data_path = config.get("data_path", "./data")
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5])
+    ])
+
+    os.makedirs(data_path, exist_ok=True)
+    full_dataset = torchvision.datasets.MNIST(
+        root=data_path,
+        train=True,  # MNIST training set is typically used for GAN training
+        download=True,
+        transform=transform,
+    )
+
+    # Synthetic fallback if MNIST download or access fails
+    if not full_dataset or len(full_dataset) == 0:
+        print("WARNING: Could not load MNIST, using synthetic data.")
+        class SyntheticMNIST(Dataset):
+            def __init__(self, n=50000, img_shape=(1, 28, 28)):
+                self.data = (torch.randn(n, *img_shape) * 0.5) + 0.5 # approx 0-1 then normalized to -1 to 1
+                self.targets = torch.randint(0, 10, (n,))
+                # Apply the same transform
+                self.data = torch.stack([transform(img) for img in self.data])
+
+            def __len__(self): return len(self.data)
+            def __getitem__(self, idx): return self.data[idx], self.targets[idx]
+        full_dataset = SyntheticMNIST()
+
+
+    # Split into train/validation following the example pattern
+    val_ratio = config.get("val_ratio", 0.1)
+    n_total = len(full_dataset)
+    n_val = max(1, int(n_total * val_ratio))
+    n_train = n_total - n_val
+    
+    train_ds, val_ds = random_split(
+        full_dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(config.get("seed", 42)),
+    )
+    
+    ds = train_ds if split == "train" else val_ds
+    
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: nn.Module, # This is the Generator
+    batch: tuple | list,
+    optimizer, # This optimizer is for the Generator
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass for the Generator. Returns the raw g_loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally on the Generator.
+    The Discriminator is instantiated locally and its weights are not federated nor
+    updated by the FL framework's optimizer in this pattern. It serves as a fixed oracle.
+    """
+    global _global_discriminator, _global_discriminator_device, _global_discriminator_config_hash
+
+    device = next(model.parameters()).device
+    
+    # Get batch data
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        imgs, _ = batch[0], batch[1] # We only need imgs
+    elif isinstance(batch, dict):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        imgs = batch.get("input", batch.get("x", batch.get("image")))
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    latent_dim = config.get("latent_dim", 100)
+    img_shape = tuple(config.get("img_shape", (1, 28, 28)))
+
+    # Use a hash of critical config items to determine if discriminator needs re-initialization
+    current_config_hash = hash(frozenset(config.items()))
+
+    # Initialize or move the local Discriminator to device
+    if (_global_discriminator is None or 
+        _global_discriminator_device != device or 
+        _global_discriminator_config_hash != current_config_hash):
+        
+        # Re-instantiate if config changes or device changes
+        _global_discriminator = Discriminator(img_shape=img_shape).to(device)
+        _global_discriminator_device = device
+        _global_discriminator_config_hash = current_config_hash
+        
+        # Optionally load a pre-trained D state_dict from config if available
+        # e.g., if "discriminator_state_dict" in config:
+        #    _global_discriminator.load_state_dict(config["discriminator_state_dict"])
+        
+        _global_discriminator.eval() # Treat as fixed during Generator training step
+        for param in _global_discriminator.parameters():
+            param.requires_grad = False # Ensure no gradient updates for D from G's loss
+
+    discriminator = _global_discriminator
+    
+    # Sample noise
+    z = torch.randn(imgs.shape[0], latent_dim, device=device)
+
+    # Train generator:
+    # Generator tries to make discriminator output 'real' (1) for fake images.
+    # The 'valid' tensor represents the target for the Discriminator when evaluating generated images.
+    valid = torch.ones(imgs.size(0), 1, device=device)
+
+    # Adversarial loss for generator
+    # model(z) is generator(z)
+    g_loss = adversarial_loss(discriminator(model(z)), valid)
+    
+    return g_loss
+```

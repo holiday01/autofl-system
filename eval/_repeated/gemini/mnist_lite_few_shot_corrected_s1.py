@@ -1,0 +1,196 @@
+"""
+Auto-generated FL client module.
+Original script: generative_adversarial_net.py
+
+Exposes:
+  build_model(config)               -> nn.Module
+  build_dataloader(config, split)   -> DataLoader
+  train_step(model, batch, opt, config) -> loss tensor (with grad_fn)
+
+CONTRACT (read carefully before copying this pattern):
+  - train_step performs ONE forward pass and returns the raw loss tensor.
+  - The returned tensor MUST have grad_fn attached (do NOT call .detach()).
+  - Do NOT call loss.backward() inside train_step.
+  - Do NOT call optimizer.step() or optimizer.zero_grad() inside train_step.
+  - Do NOT call .item() on the returned loss.
+  The FL runtime owns backward(), step(), and metric extraction.
+
+NOTE: This conversion for GANs is a simplification due to the FL train_step
+contract expecting a single model and single loss for optimization. In this
+FL client, the `train_step` is configured to train only the Generator by
+temporarily freezing the Discriminator's parameters. A full client-side GAN
+training typically involves alternating steps for both Generator and
+Discriminator, each with its own loss and optimizer updates.
+"""
+import math
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
+import torchvision
+
+
+class Generator(nn.Module):
+    def __init__(self, latent_dim: int = 100, img_shape: tuple = (1, 28, 28)):
+        super().__init__()
+        self.img_shape = img_shape
+
+        def block(in_feat, out_feat, normalize=True):
+            layers = [nn.Linear(in_feat, out_feat)]
+            if normalize:
+                layers.append(nn.BatchNorm1d(out_feat, 0.8))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *block(latent_dim, 128, normalize=False),
+            *block(128, 256),
+            *block(256, 512),
+            *block(512, 1024),
+            nn.Linear(1024, int(math.prod(img_shape))),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        img = self.model(z)
+        return img.view(img.size(0), *self.img_shape)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, img_shape):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(int(math.prod(img_shape)), 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 1),
+        )
+
+    def forward(self, img):
+        img_flat = img.view(img.size(0), -1)
+        return self.model(img_flat)
+
+
+# We create a wrapper nn.Module that holds both Generator and Discriminator
+# to represent the single 'model' expected by the FL runtime.
+class FLGANClientModel(nn.Module):
+    def __init__(
+        self,
+        img_shape: tuple = (1, 28, 28),
+        latent_dim: int = 100,
+    ):
+        super().__init__()
+        self.generator = Generator(latent_dim=latent_dim, img_shape=img_shape)
+        self.discriminator = Discriminator(img_shape=img_shape)
+
+    # The forward method of this wrapper typically represents the Generator's forward pass,
+    # as it's the component usually involved in generating samples.
+    def forward(self, z):
+        return self.generator(z)
+
+    @staticmethod
+    def adversarial_loss(y_hat, y):
+        return F.binary_cross_entropy_with_logits(y_hat, y)
+
+
+# ── FL Interface ────────────────────────────────────────────────────────
+
+def build_model(config: dict) -> nn.Module:
+    kwargs = config.get("model_kwargs", {})
+    return FLGANClientModel(**kwargs)
+
+
+def build_dataloader(config: dict, split: str = "train") -> DataLoader:
+    local = config.get("local", {})
+    batch_size = local.get("batch_size", config.get("batch_size", 32))  # Default batch size
+    num_workers = local.get("num_workers", config.get("num_workers", 2))
+    pin_memory = local.get("pin_memory", True)
+
+    data_path = config.get("data_path", "./data")
+    os.makedirs(data_path, exist_ok=True)
+
+    transform = torchvision.transforms.Compose([
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize([0.5], [0.5]),  # Normalize images to [-1, 1]
+    ])
+
+    if split == "train":
+        dataset = torchvision.datasets.MNIST(
+            root=data_path, train=True, download=True, transform=transform
+        )
+    else:  # "val" or "test"
+        dataset = torchvision.datasets.MNIST(
+            root=data_path, train=False, download=True, transform=transform
+        )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
+
+
+def train_step(
+    model: FLGANClientModel,  # Type hint updated to our wrapper
+    batch: tuple | list,
+    optimizer,  # Single optimizer for the `model`
+    config: dict,
+) -> torch.Tensor:
+    """
+    ONE forward pass.  Returns the raw loss tensor WITH grad_fn attached.
+    The FL runtime calls loss.backward() and optimizer.step() externally —
+    do NOT do either here, and do NOT detach() or .item() the returned loss.
+
+    NOTE: For GANs, this `train_step` is a simplification. It currently
+    implements only the Generator's training step, by temporarily freezing
+    the Discriminator's parameters. This adheres to the contract of returning
+    a single loss that, when backpropagated, updates a subset of the
+    `model.parameters()` (in this case, only the Generator's).
+    A full GAN training typically requires alternating optimization steps for
+    both Generator and Discriminator, which is not directly supported by the
+    standard FL `train_step` signature and contract expecting a single loss.
+    """
+    device = next(model.parameters()).device
+    if isinstance(batch, (list, tuple)):
+        batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        imgs, _ = batch[0], batch[1]  # MNIST provides (image, label), only image is used
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    generator = model.generator
+    discriminator = model.discriminator
+
+    # Get latent_dim from config, with a default
+    latent_dim = config.get("model_kwargs", {}).get("latent_dim", 100)
+
+    # Sample noise for the generator
+    z = torch.randn(imgs.shape[0], latent_dim, device=device)
+
+    # --- Train Generator ---
+    # According to the FL contract, we cannot call `optimizer.zero_grad()` here.
+    # We must ensure that only generator parameters receive gradients for this loss.
+    # Temporarily freeze discriminator parameters so they are not updated by g_loss.backward()
+    for param in discriminator.parameters():
+        param.requires_grad = False
+
+    # Define ground truth for generator (labels are 'real' for generated images)
+    valid_labels = torch.ones(imgs.size(0), 1, device=device)
+
+    # Compute generator loss: D(G(z)) should be classified as real
+    g_loss = model.adversarial_loss(discriminator(generator(z)), valid_labels)
+
+    # Unfreeze discriminator parameters (important for subsequent steps if FL runtime manages them,
+    # or if this function was modified to also train D).
+    for param in discriminator.parameters():
+        param.requires_grad = True
+
+    # The FL runtime will call `g_loss.backward()` and `optimizer.step()`
+    # Since discriminator parameters had `requires_grad=False`, only generator
+    # parameters will be updated.
+    return g_loss
